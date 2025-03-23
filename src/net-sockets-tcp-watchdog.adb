@@ -92,7 +92,7 @@ package body Watchdog is
             if Now - Prev_Pass > Check_TCP_Status_Time then
                Prev_Pass := Prev_Pass + Check_TCP_Status_Time;
 
-               Check_Statuses;
+               Check_Timeouts;
             end if;
 
             delay until Now + Read_Delay;

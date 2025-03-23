@@ -174,15 +174,15 @@ private
       Processed : out Boolean);
    --  Process received data. Processed = True if data has been processed
 
-   procedure Check_Statuses (This : Socket_Access);
+   procedure Check_Timeouts (This : Socket_Access);
    --  Proces TTLs.
+
+   procedure Check_Timeouts;
+   --  Procedures that should be called in Check_TCP_Status_Time interval to
+   --  processs TTLs.
 
    procedure Check_Time_Wait (This : Socket_Access);
    --  Check that we pass timeout
-
-   procedure Check_Statuses;
-   --  Procedures that should be called in Check_TCP_Status_Time interval to
-   --  processs TTLs.
 
    procedure Received (Packet : Net.Buffers.Buffer_Type);
    --  To process received data

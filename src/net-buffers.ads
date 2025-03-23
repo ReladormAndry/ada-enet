@@ -103,6 +103,9 @@ package Net.Buffers is
    --  We always have NET_BUF_SIZE < NET_ALLOC_SIZE.
    NET_BUF_SIZE   : constant Uint32;
 
+   --  Count of the packets
+   Packets_Count  : Uint32;
+
    --  The packet type identifies the content of the packet for the serialization/deserialization.
    type Packet_Type is
      (RAW_PACKET, ETHER_PACKET, ARP_PACKET, IP_PACKET, UDP_PACKET, TCP_PACKET,
@@ -324,11 +327,6 @@ package Net.Buffers is
      (From : in out Buffer_List;
       Buf  : in out Buffer_Type);
    --  Copy data from the head to the buf
-
-   procedure Copy_And_Release
-     (From : in out Buffer_List;
-      Buf  : in out Buffer_Type);
-   --  Copy data from the head to the buf and release head
 
    procedure Transfer (To   : in out Buffer_List;
                        From : in out Buffer_List) with

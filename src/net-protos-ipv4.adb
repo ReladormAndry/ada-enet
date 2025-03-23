@@ -165,7 +165,7 @@ package body Net.Protos.IPv4 is
       if Check_Sum then
          return Ip.Ip_Sum = 0
            or else Net.Utils.Check_Checksum
-             (To_Address (Ip), Ip.Ip_Len, Ip.Ip_Sum);
+             (To_Address (Ip), Uint16 (Ip.Ip_Ihl and 16#0F#) * 4);
       else
          return True;
       end if;

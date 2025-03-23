@@ -579,17 +579,6 @@ package body Net.Buffers is
       Buf.Size        := Buf.Packet.Size;
    end Copy;
 
-   procedure Copy_And_Release
-     (From : in out Buffer_List;
-      Buf  : in out Buffer_Type)
-   is
-      Tmp : Buffer_Type;
-   begin
-      Copy (From, Buf);
-      Peek (From, Tmp);
-      Release (Tmp);
-   end Copy_And_Release;
-
    --  ------------------------------
    --  Transfer the list of buffers held by <tt>From</tt> at end of the list held
    --  by <tt>To</tt>.  After the transfer, the <tt>From</tt> list is empty.
@@ -614,9 +603,9 @@ package body Net.Buffers is
    --  ------------------------------
    procedure Add_Region (Addr : in System.Address;
                          Size : in Uint32) is
-      Count : constant Uint32 := Size / NET_ALLOC_SIZE;
    begin
-      Manager.Add_Region (Addr, Count);
+      Packets_Count := Size / NET_ALLOC_SIZE;
+      Manager.Add_Region (Addr, Packets_Count);
    end Add_Region;
 
    protected body Manager is

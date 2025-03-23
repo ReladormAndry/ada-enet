@@ -35,13 +35,11 @@ package Net.Utils is
 
    function TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Uint16;
 
-   function Check_TCP_Checksum
-     (Buf : Net.Buffers.Buffer_Type; Sum : Uint16) return Boolean;
+   function Check_TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Boolean;
 
    function Check_Checksum
      (Address : System.Address;
-      Lenght  : Uint16;
-      Sum     : Uint16)
+      Lenght  : Uint16)
       return Boolean;
 
 private
