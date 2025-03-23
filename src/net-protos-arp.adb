@@ -43,7 +43,6 @@ package body Net.Protos.Arp is
 
    ARP_MAX_RETRY : constant Positive := 15;
 
-
    type Arp_Entry;
    type Arp_Entry_Access is access all Arp_Entry;
 
@@ -90,7 +89,6 @@ package body Net.Protos.Arp is
       Table      : Arp_Table := (others => null);
       Queue_Size : Natural := 0;
    end Database;
-
 
    protected body Database is
 

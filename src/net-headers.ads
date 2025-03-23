@@ -74,6 +74,8 @@ package Net.Headers is
    end record;
    type IP_Header_Access is access all IP_Header;
 
+   function IP_Header_Length (Header : IP_Header_Access) return Uint16;
+
    --  UDP packet header RFC 768.
    type UDP_Header is record
       Uh_Sport    : Uint16;
@@ -112,6 +114,38 @@ package Net.Headers is
       Th_Urp      : Uint16;
    end record;
    type TCP_Header_Access is access all TCP_Header;
+
+   TCP_Header_Octets     : constant := 20;
+   TCP_Header_Net_Octets : constant := 80; -- 20/4 << 4
+
+   Th_Flags_Urg  : constant Uint8 := 2#0010_0000#;
+   Th_Flags_Ack  : constant Uint8 := 2#0001_0000#;
+   Th_Flags_Push : constant Uint8 := 2#0000_1000#;
+   Th_Flags_Rst  : constant Uint8 := 2#0000_0100#;
+   Th_Flags_Syn  : constant Uint8 := 2#0000_0010#;
+   Th_Flags_Fin  : constant Uint8 := 2#0000_0001#;
+
+   TCP_Option_End       : constant := 0;
+   TCP_Option_NOP       : constant := 1;
+   TCP_Option_MSS       : constant := 2;
+   TCP_Option_Win_Scale : constant := 3;
+
+   function TCP_Header_Length (Header : TCP_Header_Access) return Uint16;
+
+   type TCP_Pseudo_Header is record
+      Source_IP      : Ip_Addr;
+      Destination_IP : Ip_Addr;
+      Zero           : Uint8;
+      Protocol       : Uint8;
+      TCP_Length     : Uint16;
+      --  The TCP Length is the TCP header length plus the data length in
+      --  octets (this is not an explicitly transmitted quantity, but is
+      --  computed), and it does not count the 12 octets of the pseudo
+      --  header.
+   end record;
+   type TCP_Pseudo_Header_Access is access all TCP_Pseudo_Header;
+
+   TCP_Pseudo_Header_Octets : constant := 12;
 
    ICMP_ECHO_REPLY           : constant Uint8 := 0;
    ICMP_UNREACHABLE          : constant Uint8 := 3;

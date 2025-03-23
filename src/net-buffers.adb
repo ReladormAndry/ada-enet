@@ -21,7 +21,7 @@ package body Net.Buffers is
    ETHER_POS  : constant Uint16 := 0;
    IP_POS     : constant Uint16 := ETHER_POS + 14;
    UDP_POS    : constant Uint16 := IP_POS + 20;  --  Note: this is wrong due to IP options.
-   --  TCP_POS    : constant Uint16 := IP_POS + 24;  --  Note: this is wrong due to IP options.
+   TCP_POS    : constant Uint16 := IP_POS + 20;
    IGMP_POS   : constant Uint16 := IP_POS + 24;
    ICMP_POS   : constant Uint16 := IP_POS + 20;
    DHCP_POS   : constant Uint16 := IP_POS + 20 + 8;
@@ -36,6 +36,7 @@ package body Net.Buffers is
       IP_PACKET    => 14 + 20,
       ICMP_PACKET  => 14 + 20 + 8,
       UDP_PACKET   => 14 + 20 + 8,
+      TCP_PACKET   => 14 + 20 + 20,
       DHCP_PACKET  => 14 + 20 + 8 + 236);
 
    function As_Ethernet is
@@ -57,6 +58,10 @@ package body Net.Buffers is
    function As_Tcp_Header is
      new Ada.Unchecked_Conversion (Source => System.Address,
                                    Target => Net.Headers.TCP_Header_Access);
+
+   function As_Tcp_Pseudo_Header is
+     new Ada.Unchecked_Conversion (Source => System.Address,
+                                   Target => Net.Headers.TCP_Pseudo_Header_Access);
 
    function As_Igmp_Header is
      new Ada.Unchecked_Conversion (Source => System.Address,
@@ -145,6 +150,21 @@ package body Net.Buffers is
       From.Size := Size;
       From.Packet := Packet;
    end Switch;
+
+   ----------
+   -- Copy --
+   ----------
+
+   procedure Copy
+     (To   : in out Buffer_Type;
+      From : Buffer_Type)
+   is
+   begin
+      To.Kind        := From.Kind;
+      To.Size        := From.Size;
+      To.Packet.Size := From.Packet.Size;
+      To.Packet.Data := From.Packet.Data;
+   end Copy;
 
    function Get_Data_Address (Buf : in Buffer_Type) return System.Address is
    begin
@@ -258,6 +278,26 @@ package body Net.Buffers is
       Buf.Pos := Pos;
    end Put_Ip;
 
+   ----------
+   -- Copy --
+   ----------
+
+   procedure Copy
+     (Buf    : in out Buffer_Type;
+      From   : Buffer_Type;
+      Start  : Net.Uint16;
+      To_End : Net.Uint16)
+   is
+      F : Raw_Data_Type (Start .. To_End)
+        with Import, Address => From.Packet.Data (Start)'Address;
+      T : Raw_Data_Type (Start .. To_End)
+        with Address => Buf.Packet.Data (Buf.Pos)'Address;
+
+   begin
+      T := F;
+      Buf.Pos := Buf.Pos + F'Length;
+   end Copy;
+
    --  ------------------------------
    --  Get a byte from the buffer, moving the buffer read position.
    --  ------------------------------
@@ -268,6 +308,18 @@ package body Net.Buffers is
       return Buf.Packet.Data (Pos);
    end Get_Uint8;
 
+   ---------------
+   -- Get_Uint8 --
+   ---------------
+
+   function Get_Uint8
+     (Buf : Buffer_Type;
+      Pos : Net.Uint16)
+      return Net.Uint8 is
+   begin
+      return Buf.Packet.Data (Pos);
+   end Get_Uint8;
+
    --  ------------------------------
    --  Get a 16-bit value in network byte order from the buffer, moving the buffer read position.
    --  ------------------------------
@@ -275,6 +327,19 @@ package body Net.Buffers is
       Pos : constant Net.Uint16 := Buf.Pos;
    begin
       Buf.Pos := Pos + 2;
+      return Interfaces.Shift_Left (Net.Uint16 (Buf.Packet.Data (Pos)), 8)
+        or Net.Uint16 (Buf.Packet.Data (Pos + 1));
+   end Get_Uint16;
+
+   -----------------
+   --  Get_Uint16 --
+   -----------------
+
+   function Get_Uint16
+     (Buf : Buffer_Type;
+      Pos : Net.Uint16)
+      return Net.Uint16 is
+   begin
       return Interfaces.Shift_Left (Net.Uint16 (Buf.Packet.Data (Pos)), 8)
         or Net.Uint16 (Buf.Packet.Data (Pos + 1));
    end Get_Uint16;
@@ -375,8 +440,30 @@ package body Net.Buffers is
    --  ------------------------------
    function TCP (Buf : in Buffer_Type) return Net.Headers.TCP_Header_Access is
    begin
-      return As_Tcp_Header (Buf.Packet.Data (20 + 14 + 2)'Address);
+      return As_Tcp_Header (Buf.Packet.Data (TCP_POS)'Address);
    end TCP;
+
+   ------------------
+   -- TCP_Position --
+   ------------------
+
+   function TCP_Position return Uint16 is
+   begin
+      return TCP_POS;
+   end TCP_Position;
+
+   ----------------
+   -- TCP_Pseudo --
+   ----------------
+
+   function TCP_Pseudo
+     (Buf : in Buffer_Type)
+      return Net.Headers.TCP_Pseudo_Header_Access is
+   begin
+      return As_Tcp_Pseudo_Header
+        (Buf.Packet.Data
+           (TCP_POS - Net.Headers.TCP_Pseudo_Header_Octets)'Address);
+   end TCP_Pseudo;
 
    --  ------------------------------
    --  Get access to the IGMP header.
@@ -426,12 +513,33 @@ package body Net.Buffers is
       Buf.Packet      := null;
    end Insert;
 
+   ------------
+   -- Append --
+   ------------
+
+   procedure Append
+     (Into : in out Buffer_List;
+      Buf  : in out Buffer_Type) is
+   begin
+      if Into.Head = null then
+         Into.Head := Buf.Packet;
+         Into.Tail := Buf.Packet;
+      else
+         Into.Tail.Next := Buf.Packet;
+         Into.Tail := Buf.Packet;
+      end if;
+      Buf.Packet.Next := null;
+      Buf.Packet := null;
+   end Append;
+
    --  ------------------------------
    --  Release all the buffers held by the list.
    --  ------------------------------
    procedure Release (List : in out Buffer_List) is
    begin
-      Manager.Release (List);
+      if not Is_Empty (List) then
+         Manager.Release (List);
+      end if;
    end Release;
 
    --  ------------------------------
@@ -458,6 +566,30 @@ package body Net.Buffers is
       end if;
    end Peek;
 
+   ----------
+   -- Copy --
+   ----------
+
+   procedure Copy
+     (From : in out Buffer_List;
+      Buf  : in out Buffer_Type) is
+   begin
+      Buf.Packet.Data := From.Head.Data;
+      Buf.Packet.Size := From.Head.Size;
+      Buf.Size        := Buf.Packet.Size;
+   end Copy;
+
+   procedure Copy_And_Release
+     (From : in out Buffer_List;
+      Buf  : in out Buffer_Type)
+   is
+      Tmp : Buffer_Type;
+   begin
+      Copy (From, Buf);
+      Peek (From, Tmp);
+      Release (Tmp);
+   end Copy_And_Release;
+
    --  ------------------------------
    --  Transfer the list of buffers held by <tt>From</tt> at end of the list held
    --  by <tt>To</tt>.  After the transfer, the <tt>From</tt> list is empty.
@@ -468,7 +600,7 @@ package body Net.Buffers is
    begin
       if To.Tail /= null then
          To.Tail.Next := From.Head;
-         From.Head := To.Head;
+         To.Tail := From.Tail;
       else
          To.Tail := From.Tail;
          To.Head := From.Head;

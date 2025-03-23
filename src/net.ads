@@ -38,6 +38,8 @@ package Net is
    subtype Uint32 is Interfaces.Unsigned_32;
    subtype Uint64 is Interfaces.Unsigned_64;
 
+   subtype Int16 is Interfaces.Integer_16;
+
    --  Length of an IPv4 packet.
    type Ip_Length is new Uint16;
 
@@ -59,6 +61,7 @@ package Net is
    use type Interfaces.Unsigned_8;
    use type Interfaces.Unsigned_16;
    use type Interfaces.Unsigned_32;
+   use type Interfaces.Integer_16;
 
    --  Returns true if the IPv4 address is a multicast address.
    function Is_Multicast (IP : in Ip_Addr) return Boolean;

@@ -15,12 +15,19 @@
 --  See the License for the specific language governing permissions and
 --  limitations under the License.
 -----------------------------------------------------------------------
+
+with Ada.Unchecked_Conversion;
 with Net.Protos.Arp;
+with Net.Utils;
+
 package body Net.Protos.IPv4 is
 
    use type Net.Protos.Arp.Arp_Status;
 
    Packet_Id : Uint16 := 1;
+
+   function To_Address is new Ada.Unchecked_Conversion
+     (Net.Headers.IP_Header_Access, System.Address);
 
    --  ------------------------------
    --  Send the raw IPv4 packet to the interface.  The destination Ethernet address is
@@ -113,5 +120,55 @@ package body Net.Protos.IPv4 is
 
       Send_Raw (Ifnet, Target_Ip, Packet, Status);
    end Send;
+
+   ---------------------------
+   -- Is_Valid_ETHER_Packet --
+   ---------------------------
+
+   function Is_Valid_ETHER_Packet
+     (Packet : Net.Buffers.Buffer_Type)
+      return Boolean is
+   begin
+      return Packet.Get_Length >= 14;
+   end Is_Valid_ETHER_Packet;
+
+   -------------
+   -- To_Host --
+   -------------
+
+   procedure To_Host (IP : Net.Headers.IP_Header_Access) is
+   begin
+      IP.Ip_Len := Net.Headers.To_Host (IP.Ip_Len);
+      IP.Ip_Id  := Net.Headers.To_Host (IP.Ip_Id);
+      IP.Ip_Off := Net.Headers.To_Host (IP.Ip_Off);
+      IP.Ip_Sum := Net.Headers.To_Host (IP.Ip_Sum);
+   end To_Host;
+
+   ------------------------
+   -- Is_Valid_IP_Packet --
+   ------------------------
+
+   function Is_Valid_IP_Packet
+     (Packet    : Net.Buffers.Buffer_Type;
+      Check_Sum : Boolean := True)
+      return Boolean
+   is
+      Ip : constant Net.Headers.IP_Header_Access := Packet.IP;
+   begin
+      if Packet.Get_Length < 34
+        or else Packet.Get_Length < Ip.Ip_Len
+        or else (Standard.Interfaces.Shift_Right (Ip.Ip_Ihl, 4)) /= 4 --  Ver
+      then
+         return False;
+      end if;
+
+      if Check_Sum then
+         return Ip.Ip_Sum = 0
+           or else Net.Utils.Check_Checksum
+             (To_Address (Ip), Ip.Ip_Len, Ip.Ip_Sum);
+      else
+         return True;
+      end if;
+   end Is_Valid_IP_Packet;
 
 end Net.Protos.IPv4;

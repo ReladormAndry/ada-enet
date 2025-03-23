@@ -53,4 +53,18 @@ package Net.Protos.IPv4 is
      Pre => not Packet.Is_Null,
      Post => Packet.Is_Null;
 
+   function Is_Valid_ETHER_Packet
+     (Packet : Net.Buffers.Buffer_Type)
+      return Boolean;
+   --  Returns True when ethernet header is valid
+
+   procedure To_Host (IP : Net.Headers.IP_Header_Access);
+   --  Restores host bytes order
+
+   function Is_Valid_IP_Packet
+     (Packet    : Net.Buffers.Buffer_Type;
+      Check_Sum : Boolean := True)
+      return Boolean;
+   --  Returns True when IP header is valid
+
 end Net.Protos.IPv4;

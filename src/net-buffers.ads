@@ -104,11 +104,16 @@ package Net.Buffers is
    NET_BUF_SIZE   : constant Uint32;
 
    --  The packet type identifies the content of the packet for the serialization/deserialization.
-   type Packet_Type is (RAW_PACKET, ETHER_PACKET, ARP_PACKET, IP_PACKET, UDP_PACKET, ICMP_PACKET,
-                        DHCP_PACKET);
+   type Packet_Type is
+     (RAW_PACKET, ETHER_PACKET, ARP_PACKET, IP_PACKET, UDP_PACKET, TCP_PACKET,
+      ICMP_PACKET, DHCP_PACKET);
 
-   type Data_Type is array (Net.Uint16 range 0 .. 1500 + 31) of aliased Uint8 with
-     Alignment => 32;
+   Max_Data_Type_Size : constant := 1500 + 31;
+
+   type Data_Type is array (Net.Uint16 range 0 .. Max_Data_Type_Size) of
+     aliased Uint8 with Alignment => 32;
+
+   type Raw_Data_Type is array (Net.Uint16 range <>) of Uint8;
 
    type Buffer_Type is tagged limited private;
 
@@ -137,6 +142,11 @@ package Net.Buffers is
                      From : in out Buffer_Type) with
      Pre => not From.Is_Null and not To.Is_Null,
      Post => not From.Is_Null and not To.Is_Null;
+
+   procedure Copy (To   : in out Buffer_Type;
+                   From : Buffer_Type) with
+     Pre => not From.Is_Null and not To.Is_Null;
+   --  Copy data Form -> To
 
    --
    function Get_Data_Address (Buf : in Buffer_Type) return System.Address;
@@ -183,13 +193,33 @@ package Net.Buffers is
                      Value : in Ip_Addr) with
      Pre => not Buf.Is_Null;
 
+   procedure Copy
+     (Buf    : in out Buffer_Type;
+      From   : Buffer_Type;
+      Start  : Net.Uint16;
+      To_End : Net.Uint16)
+       with Pre => not Buf.Is_Null and not From.Is_Null;
+
    --  Get a byte from the buffer, moving the buffer read position.
    function Get_Uint8 (Buf : in out Buffer_Type) return Net.Uint8 with
      Pre => not Buf.Is_Null;
 
+   function Get_Uint8
+     (Buf : Buffer_Type;
+      Pos : Net.Uint16)
+      return Net.Uint8
+     with Pre => not Buf.Is_Null;
+
    --  Get a 16-bit value in network byte order from the buffer, moving the buffer read position.
    function Get_Uint16 (Buf : in out Buffer_Type) return Net.Uint16 with
      Pre => not Buf.Is_Null;
+
+   --  Get Uint16 from the Position
+   function Get_Uint16
+     (Buf : Buffer_Type;
+      Pos : Net.Uint16)
+      return Net.Uint16
+     with Pre => not Buf.Is_Null;
 
    --  Get a 32-bit value in network byte order from the buffer, moving the buffer read position.
    function Get_Uint32 (Buf : in out Buffer_Type) return Net.Uint32 with
@@ -233,6 +263,16 @@ package Net.Buffers is
    function TCP (Buf : in Buffer_Type) return Net.Headers.TCP_Header_Access with
      Pre => not Buf.Is_Null;
 
+   function TCP_Position return Uint16;
+   --  Returns Position where TCP header starts
+
+   --  Get access to the TCP pseudo header. It is mapped on the IP header so
+   --  the last should be restored after.
+   function TCP_Pseudo
+     (Buf : in Buffer_Type)
+      return Net.Headers.TCP_Pseudo_Header_Access
+     with Pre => not Buf.Is_Null;
+
    --  Get access to the IGMP header.
    function IGMP (Buf : in Buffer_Type) return Net.Headers.IGMP_Header_Access with
      Pre => not Buf.Is_Null;
@@ -257,6 +297,13 @@ package Net.Buffers is
      Pre => not Buf.Is_Null,
      Post => Buf.Is_Null and not Is_Empty (Into);
 
+   --  Add buf to the end of list
+   procedure Append
+     (Into : in out Buffer_List;
+      Buf  : in out Buffer_Type) with
+     Pre => not Buf.Is_Null,
+     Post => Buf.Is_Null and not Is_Empty (Into);
+
    --  Release all the buffers held by the list.
    procedure Release (List : in out Buffer_List);
 
@@ -272,6 +319,17 @@ package Net.Buffers is
    --  Transfer the list of buffers held by <tt>From</tt> at end of the list held
    --  by <tt>To</tt>.  After the transfer, the <tt>From</tt> list is empty.
    --  The complexity is in O(1).
+
+   procedure Copy
+     (From : in out Buffer_List;
+      Buf  : in out Buffer_Type);
+   --  Copy data from the head to the buf
+
+   procedure Copy_And_Release
+     (From : in out Buffer_List;
+      Buf  : in out Buffer_Type);
+   --  Copy data from the head to the buf and release head
+
    procedure Transfer (To   : in out Buffer_List;
                        From : in out Buffer_List) with
      Post => Is_Empty (From);

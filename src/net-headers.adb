@@ -41,4 +41,22 @@ package body Net.Headers is
 
    function To_Host (Val : in Uint16) return Uint16 renames To_Network;
 
+   ----------------------
+   -- IP_Header_Length --
+   ----------------------
+
+   function IP_Header_Length (Header : IP_Header_Access) return Uint16 is
+   begin
+      return 4 * Uint16 (Header.Ip_Ihl and 16#F#);
+   end IP_Header_Length;
+
+   ----------------
+   -- TCP_Offset --
+   ----------------
+
+   function TCP_Header_Length (Header : TCP_Header_Access) return Uint16 is
+   begin
+      return 4 * Uint16 (Standard.Interfaces.Shift_Right (Header.Th_Off, 4));
+   end TCP_Header_Length;
+
 end Net.Headers;

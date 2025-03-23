@@ -1,0 +1,24 @@
+--  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+with "../../config/enet_config.gpr";
+project TCP_Client is
+
+   for Source_Dirs use ("src/", "config/");
+   for Object_Dir use "obj/" & Config.Build_Profile;
+   for Create_Missing_Dirs use "True";
+   for Exec_Dir use "bin";
+   for Main use ("tcp_client.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use Config.Ada_Compiler_Switches;
+   end Compiler;
+
+   package Binder is
+      for Switches ("Ada") use ("-Es"); --  Symbolic traceback
+   end Binder;
+
+   package Install is
+      for Artifacts (".") use ("share");
+   end Install;
+
+end TCP_Client;

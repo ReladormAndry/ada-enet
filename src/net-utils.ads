@@ -15,6 +15,8 @@
 --  See the License for the specific language governing permissions and
 --  limitations under the License.
 -----------------------------------------------------------------------
+with Net.Buffers;
+
 package Net.Utils is
 
    --  Convert the IPv4 address to a dot string representation.
@@ -31,6 +33,17 @@ package Net.Utils is
    procedure Set_Random_Function (Value : Custom_Random_Function);
    --  Provide alternative random number generation function.
 
+   function TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Uint16;
+
+   function Check_TCP_Checksum
+     (Buf : Net.Buffers.Buffer_Type; Sum : Uint16) return Boolean;
+
+   function Check_Checksum
+     (Address : System.Address;
+      Lenght  : Uint16;
+      Sum     : Uint16)
+      return Boolean;
+
 private
 
    function Default_Random return Uint32;
@@ -39,5 +52,13 @@ private
      Default_Random'Access;
 
    function Random return Uint32 is (Random_Function.all);
+
+   function Get_Checksum_Lenght
+     (Buf : Net.Buffers.Buffer_Type) return Uint16;
+
+   function Calculate_Checksum
+     (Address : System.Address;
+      Lenght  : Uint16)
+      return Uint16;
 
 end Net.Utils;
