@@ -269,13 +269,6 @@ package Net.Buffers is
    function TCP_Position return Uint16;
    --  Returns Position where TCP header starts
 
-   --  Get access to the TCP pseudo header. It is mapped on the IP header so
-   --  the last should be restored after.
-   function TCP_Pseudo
-     (Buf : in Buffer_Type)
-      return Net.Headers.TCP_Pseudo_Header_Access
-     with Pre => not Buf.Is_Null;
-
    --  Get access to the IGMP header.
    function IGMP (Buf : in Buffer_Type) return Net.Headers.IGMP_Header_Access with
      Pre => not Buf.Is_Null;

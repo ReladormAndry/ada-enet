@@ -59,10 +59,6 @@ package body Net.Buffers is
      new Ada.Unchecked_Conversion (Source => System.Address,
                                    Target => Net.Headers.TCP_Header_Access);
 
-   function As_Tcp_Pseudo_Header is
-     new Ada.Unchecked_Conversion (Source => System.Address,
-                                   Target => Net.Headers.TCP_Pseudo_Header_Access);
-
    function As_Igmp_Header is
      new Ada.Unchecked_Conversion (Source => System.Address,
                                    Target => Net.Headers.IGMP_Header_Access);
@@ -451,19 +447,6 @@ package body Net.Buffers is
    begin
       return TCP_POS;
    end TCP_Position;
-
-   ----------------
-   -- TCP_Pseudo --
-   ----------------
-
-   function TCP_Pseudo
-     (Buf : in Buffer_Type)
-      return Net.Headers.TCP_Pseudo_Header_Access is
-   begin
-      return As_Tcp_Pseudo_Header
-        (Buf.Packet.Data
-           (TCP_POS - Net.Headers.TCP_Pseudo_Header_Octets)'Address);
-   end TCP_Pseudo;
 
    --  ------------------------------
    --  Get access to the IGMP header.

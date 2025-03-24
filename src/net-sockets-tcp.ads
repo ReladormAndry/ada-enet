@@ -29,7 +29,6 @@ generic
    --  Priority for the protected objects and read watchdog
 
    Check_Incoming_Checksums : Boolean;
-   Send_Outcoming_Checksums : Boolean;
 
 package Net.Sockets.Tcp is
 

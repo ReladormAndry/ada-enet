@@ -15,6 +15,8 @@
 --  See the License for the specific language governing permissions and
 --  limitations under the License.
 -----------------------------------------------------------------------
+
+with Net.Headers;
 with Net.Buffers;
 
 package Net.Utils is
@@ -33,9 +35,15 @@ package Net.Utils is
    procedure Set_Random_Function (Value : Custom_Random_Function);
    --  Provide alternative random number generation function.
 
-   function TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Uint16;
+   function TCP_Checksum
+     (Pseudo_Header : Net.Headers.TCP_Pseudo_Header;
+      Buf           : Net.Buffers.Buffer_Type)
+      return Uint16;
 
-   function Check_TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Boolean;
+   function Check_TCP_Checksum
+     (Pseudo_Header : Net.Headers.TCP_Pseudo_Header;
+      Buf           : Net.Buffers.Buffer_Type)
+      return Boolean;
 
    function Check_Checksum
      (Address : System.Address;
@@ -51,12 +59,12 @@ private
 
    function Random return Uint32 is (Random_Function.all);
 
-   function Get_Checksum_Lenght
-     (Buf : Net.Buffers.Buffer_Type) return Uint16;
-
    function Calculate_Checksum
      (Address : System.Address;
-      Lenght  : Uint16)
+      Lenght  : Uint16;
+      From    : Uint32)
       return Uint16;
+
+   function Checksum (Header : Net.Headers.TCP_Pseudo_Header) return Uint32;
 
 end Net.Utils;

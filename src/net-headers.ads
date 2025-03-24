@@ -129,6 +129,7 @@ package Net.Headers is
    TCP_Option_NOP       : constant := 1;
    TCP_Option_MSS       : constant := 2;
    TCP_Option_Win_Scale : constant := 3;
+   TCP_Option_SACK      : constant := 4;
 
    function TCP_Header_Length (Header : TCP_Header_Access) return Uint16;
 
@@ -143,9 +144,6 @@ package Net.Headers is
       --  computed), and it does not count the 12 octets of the pseudo
       --  header.
    end record;
-   type TCP_Pseudo_Header_Access is access all TCP_Pseudo_Header;
-
-   TCP_Pseudo_Header_Octets : constant := 12;
 
    ICMP_ECHO_REPLY           : constant Uint8 := 0;
    ICMP_UNREACHABLE          : constant Uint8 := 3;

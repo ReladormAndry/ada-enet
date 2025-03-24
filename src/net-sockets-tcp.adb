@@ -863,7 +863,7 @@ package body Net.Sockets.Tcp is
          Status : out Error_Code)
       is
          Tcp_Header    : TCP_Header_Access;
-         Pseudo_Header : TCP_Pseudo_Header_Access;
+         Pseudo_Header : TCP_Pseudo_Header;
          Local         : Buffer_Type;
 
       begin
@@ -889,17 +889,14 @@ package body Net.Sockets.Tcp is
          Tcp_Header.Th_Urp := 0;
 
          --  Compute checksum
-         Tcp_Header.Th_Sum := 0;
-         if Send_Outcoming_Checksums then
-            Pseudo_Header                := Packet.TCP_Pseudo;
-            Pseudo_Header.Source_IP      := Local_Addr;
-            Pseudo_Header.Destination_IP := Remote_Addr;
-            Pseudo_Header.Zero           := 0;
-            Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
-            Pseudo_Header.TCP_Length     := Get_Data_Size (Packet, IP_PACKET);
+         Pseudo_Header.Source_IP      := Local_Addr;
+         Pseudo_Header.Destination_IP := Remote_Addr;
+         Pseudo_Header.Zero           := 0;
+         Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
+         Pseudo_Header.TCP_Length     := Get_Data_Size (Packet, IP_PACKET);
 
-            Tcp_Header.Th_Sum := Net.Utils.TCP_Checksum (Packet);
-         end if;
+         Tcp_Header.Th_Sum := 0;
+         Tcp_Header.Th_Sum := Net.Utils.TCP_Checksum (Pseudo_Header, Packet);
 
          --  Initialize retransmitting data
          if Retransmitting_Sequence = 0
@@ -935,8 +932,9 @@ package body Net.Sockets.Tcp is
 
       exception
          when others =>
-            Release (Local);
-            Release (Packet);
+            if not Is_Null (Local) then
+               Insert (Send_Queue, Local);
+            end if;
       end Send_Packet;
 
       --------------
@@ -1875,11 +1873,13 @@ package body Net.Sockets.Tcp is
      (This   : in out Socket;
       Status : out Status_Kind) is
    begin
-      States (This.State_No).Close (Status);
-      if Status = Ok then
-         This.Callback_Proc := null;
-      else
-         Call_Callback (This);
+      if This.State_No /= 0 then
+         States (This.State_No).Close (Status);
+         if Status = Ok then
+            This.Callback_Proc := null;
+         else
+            Call_Callback (This);
+         end if;
       end if;
    end Close;
 
@@ -1908,15 +1908,13 @@ package body Net.Sockets.Tcp is
       Payload_Length   : Uint16;
       Packet_IP        : constant IP_Header_Access  := Packet.IP;
       Packet_TCP       : constant TCP_Header_Access := Packet.TCP;
-      Local_Pseudo     : TCP_Pseudo_Header_Access;
+      Pseudo_Header    : TCP_Pseudo_Header;
       Data_Offset      : Uint16;
       Processed        : Boolean;
 
       Ack              : Boolean;
       Seq_Num, Ack_Num : Uint32;
       Status           : Status_Kind;
-
-      Local_Buffer     : Net.Buffers.Buffer_Type;
 
    begin
 
@@ -1928,22 +1926,15 @@ package body Net.Sockets.Tcp is
       if Check_Incoming_Checksums
         and then Packet_TCP.Th_Sum /= 0
       then
-         Allocate (Local_Buffer);
-         if not Is_Null (Local_Buffer) then
-            Copy (From => Packet, To => Local_Buffer);
+         Pseudo_Header.Source_IP      := Packet_IP.Ip_Src;
+         Pseudo_Header.Destination_IP := Packet_IP.Ip_Dst;
+         Pseudo_Header.Zero           := 0;
+         Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
+         Pseudo_Header.TCP_Length     := Payload_Length;
 
-            Local_Pseudo                := Local_Buffer.TCP_Pseudo;
-            Local_Pseudo.Source_IP      := Packet_IP.Ip_Src;
-            Local_Pseudo.Destination_IP := Packet_IP.Ip_Dst;
-            Local_Pseudo.Zero           := 0;
-            Local_Pseudo.Protocol       := Net.Protos.IPv4.P_TCP;
-            Local_Pseudo.TCP_Length     := Payload_Length;
-
-            if not Net.Utils.Check_TCP_Checksum (Local_Buffer) then
-               --  Not valid checksum, do not process the packet
-               return;
-            end if;
-            Release (Local_Buffer);
+         if not Net.Utils.Check_TCP_Checksum (Pseudo_Header, Packet) then
+            --  Not valid checksum, do not process the packet
+            return;
          end if;
       end if;
 
@@ -1995,10 +1986,6 @@ package body Net.Sockets.Tcp is
                Status   => Status);
          end if;
       end if;
-
-   exception
-      when others =>
-         Release (Local_Buffer);
    end Received;
 
    --------------

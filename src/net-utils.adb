@@ -18,7 +18,7 @@
 
 with Ada.Unchecked_Conversion;
 with Interfaces;
-with Net.Headers;
+with System;
 
 package body Net.Utils is
 
@@ -31,7 +31,7 @@ package body Net.Utils is
    function Default_Random return Uint32 is separate;
 
    function To_Address is new Ada.Unchecked_Conversion
-     (Net.Headers.TCP_Pseudo_Header_Access, System.Address);
+     (Net.Headers.TCP_Header_Access, System.Address);
 
    function Hex (Value : in Uint8) return String is
       use Interfaces;
@@ -78,39 +78,45 @@ package body Net.Utils is
       Random_Function := Value;
    end Set_Random_Function;
 
-   -------------------------
-   -- Get_Checksum_Lenght --
-   -------------------------
-
-   function Get_Checksum_Lenght
-     (Buf : Net.Buffers.Buffer_Type) return Uint16 is
-   begin
-      return Net.Buffers.Get_Data_Size
-        (Buf, Net.Buffers.TCP_PACKET) +
-        Net.Headers.TCP_Header_Octets +
-          Net.Headers.TCP_Pseudo_Header_Octets;
-   end Get_Checksum_Lenght;
-
    ------------------
    -- TCP_Checksum --
    ------------------
 
-   function TCP_Checksum (Buf : Net.Buffers.Buffer_Type) return Uint16 is
+   function TCP_Checksum
+     (Pseudo_Header : Net.Headers.TCP_Pseudo_Header;
+      Buf           : Net.Buffers.Buffer_Type)
+      return Uint16 is
    begin
       return Calculate_Checksum
-        (To_Address (Buf.TCP_Pseudo), Get_Checksum_Lenght (Buf));
+        (To_Address (Buf.TCP),
+         Net.Buffers.Get_Data_Size (Buf, Net.Buffers.IP_PACKET),
+         Checksum (Pseudo_Header));
    end TCP_Checksum;
+
+   --------------
+   -- Checksum --
+   --------------
+
+   function Checksum (Header : Net.Headers.TCP_Pseudo_Header) return Uint32 is
+      Data : array (1 .. 6) of Uint16 with Import, Address => Header'Address;
+      Result : Uint32 := 0;
+   begin
+      for I in Data'Range loop
+         Result := Result + Uint32 (Data (I));
+      end loop;
+      return Result;
+   end Checksum;
 
    ------------------------
    -- Check_TCP_Checksum --
    ------------------------
 
    function Check_TCP_Checksum
-     (Buf : Net.Buffers.Buffer_Type)
+     (Pseudo_Header : Net.Headers.TCP_Pseudo_Header;
+      Buf           : Net.Buffers.Buffer_Type)
       return Boolean is
    begin
-      return Calculate_Checksum
-        (To_Address (Buf.TCP_Pseudo), Get_Checksum_Lenght (Buf)) = 0;
+      return TCP_Checksum (Pseudo_Header, Buf) = 0;
    end Check_TCP_Checksum;
 
    --------------------
@@ -122,7 +128,7 @@ package body Net.Utils is
       Lenght  : Uint16)
       return Boolean is
    begin
-      return Calculate_Checksum (Address, Lenght) = 0;
+      return Calculate_Checksum (Address, Lenght, 0) = 0;
    end Check_Checksum;
 
    ------------------------
@@ -131,28 +137,23 @@ package body Net.Utils is
 
    function Calculate_Checksum
      (Address : System.Address;
-      Lenght  : Uint16)
+      Lenght  : Uint16;
+      From    : Uint32)
       return Uint16
    is
-      Remain  : Uint16 := Lenght;
-      Result  : Uint32 := 0;
-      Data    : Net.Buffers.Raw_Data_Type (1 .. Lenght) with Import,
+      Result  : Uint32 := From;
+      Data_16 : array (1 .. Lenght / 2) of Uint16 with Import,
         Address => Calculate_Checksum.Address;
-      Pos     : Uint16 := 1;
+      Data_8 : array (1 .. Lenght) of Uint8 with Import,
+        Address => Calculate_Checksum.Address;
+
    begin
-      while Remain > 1 loop
-         Result := Result +
-           Standard.Interfaces.Shift_Left (Uint32 (Data (Pos)), 8) +
-           Uint32 (Data (Pos + 1));
-
-         Pos    := Pos + 2;
-         Remain := Remain - 2;
+      for I in Data_16'Range loop
+         Result := Result + Uint32 (Data_16 (I));
       end loop;
-      pragma Assert (Remain in 0 .. 1);
 
-      if Remain = 1 then
-         Result := Result + Interfaces.Shift_Left
-           (Uint32 (Data (Pos)), 8);
+      if Data_16'Last * 2 < Data_8'Last then
+         Result := Result + Uint32 (Data_8 (Data_8'Last));
       end if;
 
       while Result > 16#FFFF# loop
