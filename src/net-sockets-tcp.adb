@@ -3,37 +3,37 @@ with Net.Utils;
 with Net.Buffers; use Net.Buffers;
 with Net.Headers; use Net.Headers;
 
-with Net.Protos.Dispatchers;
 with Net.Protos.IPv4;
-with Net.Protos.Arp;
 
 package body Net.Sockets.Tcp is
 
-   Local_TCP_Window        : constant := 65495;
-   TCP_Window              : constant := 2048;
-   TCP_MAX_SYN_RTX         : constant := 6;
+   use type Int32;
+
+   Default_TCP_Window      : constant := 65495;
+   Initial_Send_Window     : constant := 2048;
+   Maximum_SYN_Retransmits : constant := 6;
    --  Maximum retransmits for initial (SYN) segments
-   TCP_MAX_RTX             : constant := 12;
+   Maximum_Retransmits     : constant := 12;
    --  Maximum retransmits for data segments
-   TCP_TTL                 : constant := 64;
+   TTL                     : constant := 64;
+   Timeouts_Ticks_Count    : Uint32   := 0;
 
-   One_Second              : constant Ada.Real_Time.Time_Span :=
-     Ada.Real_Time.Seconds (1);
-   One_And_Half_Second     : constant Ada.Real_Time.Time_Span :=
-     Ada.Real_Time.Microseconds (1500);
+   Timeout_Ticks_Per_Second : constant Uint32 := 2000;
+   Fin_Wait_Timeout         : constant Uint32 :=
+     Timeout_Ticks_Per_Second * 20; -- 20 s
+   Syn_Received_Timeout     : constant Uint32 :=
+     Timeout_Ticks_Per_Second * 20; -- 20 s
+   Time_Wait_Timeout        : constant Uint32 :=
+     2 * (2 * TTL) * Timeout_Ticks_Per_Second;
 
-   TCP_Ticks               : Uint32   := 0;
-   Fin_Wait_Timeout        : Uint32 := 0; -- 20 s
-   Syn_Received_Timeout    : Uint32 := 0; -- 20 s
-   Time_Wait_Timeout       : Uint32 := 0;
+   Initial_Persist_Backoff  : constant Int32  :=
+     Int32 (Timeout_Ticks_Per_Second + Timeout_Ticks_Per_Second / 2); --  1.5 s
+   Maximum_Persist_Backoff  : constant Int32  :=
+     Int32 (Timeout_Ticks_Per_Second * 60);  -- 60 s
 
-   Initial_Persist_Backoff : Int16 := 0;  -- 1.5 s
-   Max_Persist_Backoff     : Int16 := 0;  -- 60 s
-
-   package body Watchdog is separate;
-
-   function TCP_Payload_Length
-     (Packet : Net.Buffers.Buffer_Type)
+   function TCP_Data_Length
+     (Packet : Net.Buffers.Buffer_Type;
+      Header : Net.Headers.TCP_Header_Access)
       return Uint16;
 
    procedure To_Host (TCP : Net.Headers.TCP_Header_Access);
@@ -48,25 +48,27 @@ package body Net.Sockets.Tcp is
    -- State --
    -----------
 
-   protected type State_Protected_Object is
+   protected type State_Protected_Object
+     with Priority => Priority
+   is
 
-      function Get_State return Socket_State_Type;
+      function Get_State return Socket_State_Kind;
       function Is_Binded return Boolean;
 
       procedure Bind
         (This   : Socket_Access;
          Port   : Uint16;
-         Status : out Status_Kind);
+         Status : out Error_Code);
 
       procedure Connect
         (Addr   : Ip_Addr;
          Port   : Uint16;
-         Status : out Status_Kind);
+         Status : out Error_Code);
 
       procedure Send
         (Data   : Net.Buffers.Buffer_Type; --  Raw data
          Push   : Boolean;
-         Status : out Status_Kind);
+         Status : out Error_Code);
 
       function Get_Send_Room return Uint16;
 
@@ -76,12 +78,12 @@ package body Net.Sockets.Tcp is
 
       function Get_Receive_Room return Uint16;
 
-      procedure Close (Status : out Status_Kind);
+      procedure Close (Status : out Error_Code);
 
-      procedure Drop (Status : out Status_Kind);
+      procedure Drop (Status : out Error_Code);
 
       procedure Received
-        (Packet    : Net.Buffers.Buffer_Type;
+        (Packet    : in out Net.Buffers.Buffer_Type;
          Length    : Uint16;
          Processed : out Boolean);
 
@@ -91,7 +93,7 @@ package body Net.Sockets.Tcp is
    private
       Socket                  : Socket_Access := null;
 
-      State                   : Socket_State_Type := Closed;
+      State                   : Socket_State_Kind := Closed;
 
       Local_Addr              : Ip_Addr := (0, 0, 0, 0);
       Local_Port              : Uint16  := 0;
@@ -102,76 +104,91 @@ package body Net.Sockets.Tcp is
       Local_MSS               : Uint16; --  Maximum segment size for receiving
       Remote_MSS              : Uint16; --  Maximum segment size for sending
 
-      Init_Sequence_Num       : Uint32;        -- ISS
-      Next_Sequence_Num       : Uint32;        -- NSS
+      Init_Sequence_Num       : Uint32;
+      Next_Sequence_Num       : Uint32;
 
       --  Send
-      Send_Window             : Uint16;        -- SND_WND
-      Ssthresh                : Uint32 := 65_535;
+      Send_Window             : Uint16;
+      Ssthresh                : Uint32;
       Cwnd                    : Uint32;
-      Send_Unacknowledged     : Uint32;        -- SND_UNA
-      Send_Next               : Uint32;        -- SND_NXT
-      Sequence_Last_Update    : Uint32 := 0;   -- SND_WL1
-      Ask_Last_Update         : Uint32 := 0;   -- SND_WL2
+      Send_Unacknowledged     : Uint32;
+      Send_Next_Control       : Uint32;
+      Sequence_Last_Update    : Uint32;
+      Ask_Last_Update         : Uint32;
 
       --  Recive
-      Init_Recive_Num         : Uint32 := 0; --  Initial receive sequence number IRS
-      Recive_Window           : Uint16 := 0;   --  RCV_WND
-      Recive_Next             : Uint32 := 0;   --  RCV_NXT
+      Init_Recive_Num         : Uint32;
+      Receive_Window          : Uint16;
+      Receive_Next            : Uint32;
 
       Send_Queue              : Net.Buffers.Buffer_List;
       Unack_Queue             : Net.Buffers.Buffer_List;
-      Recive_Queue            : Net.Buffers.Buffer_List;
+      Received_Queue          : Net.Buffers.Buffer_List;
 
-      Retransmitting_Sequence : Uint32 := 0; --  RTT_Seq
-      Retransmitting_Ticks    : Uint32 := 0; --  RTT_Ticks
+      Retransmitting_Sequence : Uint32;
+      Retransmitting_Ticks    : Uint32;
 
-      RTT_Average             : Uint16 := 0;
-      RTT_Stddev              : Uint16 := 0;
-      RTO                     : Uint16 := 0;
+      RTT_Average             : Uint16;
+      RTT_Stddev              : Uint16;
+      RTO                     : Uint16;
 
-      Retransmit_Ticks        : Int16  := 0;
-      Retransmit_Count        : Uint8  := 0;
+      Retransmit_Ticks        : Int16;
+      Retransmit_Count        : Uint8;
 
-      Watchdog_Ticks          : Uint32 := 0;
+      Watchdog_Ticks          : Uint32;
       --  TCP ticks for watchdog timer (used for idle/keepalive, and
       --  2MSL TIME_WAIT).
 
-      Persist_Ticks           : Int16  := 0;
-      Persist_Backoff         : Int16  := 0;
+      Persist_Ticks           : Int32;
+      Persist_Backoff         : Int32;
       --  TCP ticks value for persist timer (-1 if not running, ticks count
       --  since last reset if running, and current backoff count (0 if not
       --  running).
 
       procedure Init;
-      procedure Set_State (New_State : Socket_State_Type);
+      procedure Set_State (New_State : Socket_State_Kind);
 
       procedure Send_Control
         (Syn    : Boolean;
          Fin    : Boolean;
-         Status : out Status_Kind);
+         Status : out Error_Code);
       --  Send a TCP segment with no payload, just control bits set according
       --  to Syn and Fin. Ack will be set as well unless in Syn_Sent state.
+
+      procedure Send_Rst
+        (Ack     : Boolean;
+         Seq_Num : Uint32;
+         Ack_Num : Uint32;
+         Status  : out Error_Code);
+      --  Sends RESET
 
       procedure Enqueue
         (Data   : Net.Buffers.Buffer_Type;
          Push   : Boolean;
          Syn    : Boolean;
          Fin    : Boolean;
-         Status : out Status_Kind);
+         Ack    : Boolean;
+         Status : out Error_Code);
       --  Request push onto the Send_Queue for later output by TCP_Output.
       --  Data designates a buffer to be used as payload data or TCP
       --  options, according to Options, with segments cut to be MSS bytes max
       --  each.
 
-      procedure Process_Send_Queue (Ack_Now : Boolean);
+      procedure Process_Send_Queue
+        (Ack_Now : Boolean;
+         Status  : out Error_Code);
       --  Starts output from send queue. Check whether ACK have sent if
       --  Ack_Now = True.
 
       procedure Send_Packet
         (Packet : in out Buffer_Type;
          Status : out Error_Code);
-      --  Send the segment over IP
+      --  Send the packet
+
+      procedure Push_Packet
+        (Packet : in out Buffer_Type;
+         Status : out Error_Code);
+      --  Push the packet over IP
 
       procedure Process_Ack (Packet : Net.Buffers.Buffer_Type);
       --  Process received ack in the packet
@@ -179,6 +196,8 @@ package body Net.Sockets.Tcp is
       procedure Send_Window_Probe;
 
       procedure Retransmit_Timeout;
+
+      procedure Call_Callback (Event : Tcp_Event);
 
    end State_Protected_Object;
 
@@ -198,7 +217,7 @@ package body Net.Sockets.Tcp is
    -- Reestr --
 
    protected Reestr
-     with Priority => System.Default_Priority
+     with Priority => Priority
    is
 
       procedure Add    (To   : Sockets_List_Kind; Socket : Socket_Access);
@@ -306,7 +325,7 @@ package body Net.Sockets.Tcp is
 
    end Reestr;
 
-   State_To_List : constant array (Socket_State_Type) of
+   State_To_List : constant array (Socket_State_Kind) of
      Sockets_List_Kind :=
        (Closed         => No_List,
         Syn_Sent     |
@@ -351,12 +370,12 @@ package body Net.Sockets.Tcp is
          Ssthresh                := 65_535;
          Cwnd                    := 0;
          Send_Unacknowledged     := 0;
-         Send_Next               := 0;
+         Send_Next_Control       := 0;
          Sequence_Last_Update    := 0;
          Ask_Last_Update         := 0;
-         Recive_Window           := 0;
+         Receive_Window          := 0;
          Next_Sequence_Num       := 0;
-         Recive_Next             := 0;
+         Receive_Next            := 0;
          Retransmitting_Sequence := 0;
          Retransmitting_Ticks    := 0;
          RTT_Average             := 0;
@@ -370,14 +389,14 @@ package body Net.Sockets.Tcp is
 
          Release (Send_Queue);
          Release (Unack_Queue);
-         Release (Recive_Queue);
+         Release (Received_Queue);
       end Init;
 
       ---------------
       -- Get_State --
       ---------------
 
-      function Get_State return Socket_State_Type is
+      function Get_State return Socket_State_Kind is
       begin
          return State;
       end Get_State;
@@ -398,18 +417,18 @@ package body Net.Sockets.Tcp is
       procedure Bind
         (This   : Socket_Access;
          Port   : Uint16;
-         Status : out Status_Kind) is
+         Status : out Error_Code) is
       begin
          if Socket = null
            or else Socket = This
          then
-            Status := Ok;
+            Status := EOK;
             Init;
             Socket     := This;
             Local_Addr := Ifnet.Ip;
             Local_Port := Port;
          else
-            Status := Error;
+            Status := ENOBUFS;
          end if;
       end Bind;
 
@@ -420,24 +439,23 @@ package body Net.Sockets.Tcp is
       procedure Connect
         (Addr   : Ip_Addr;
          Port   : Uint16;
-         Status : out Status_Kind) is
+         Status : out Error_Code) is
       begin
          Remote_Addr         := Addr;
          Remote_Port         := Port;
 
          Init_Sequence_Num   := Net.Utils.Random;
          Next_Sequence_Num   := Init_Sequence_Num;
-
          Send_Unacknowledged := Init_Sequence_Num - 1;
-         Send_Next           := Init_Sequence_Num;
+         Send_Next_Control   := Init_Sequence_Num;
 
-         Recive_Window       := Uint16'Min
-           (Local_TCP_Window,
+         Receive_Window      := Uint16'Min
+           (Default_TCP_Window,
             Uint16
               (Net.Buffers.Packets_Count / 2 / Uint32 (Max_Sockets_Count)) *
                 Max_Packet_Size);
-         Send_Window         := TCP_Window;
-         Cwnd                := TCP_Window;
+         Send_Window         := Initial_Send_Window;
+         Cwnd                := Initial_Send_Window;
 
          Set_State (Syn_Sent);
 
@@ -447,7 +465,7 @@ package body Net.Sockets.Tcp is
 
       exception
          when others =>
-            Status := Error;
+            Status := ENOBUFS;
       end Connect;
 
       ----------
@@ -457,7 +475,7 @@ package body Net.Sockets.Tcp is
       procedure Send
         (Data   : Net.Buffers.Buffer_Type;
          Push   : Boolean;
-         Status : out Status_Kind) is
+         Status : out Error_Code) is
       begin
          case State is
             when Established | Close_Wait | Syn_Sent | Syn_Received =>
@@ -466,9 +484,10 @@ package body Net.Sockets.Tcp is
                   Push   => Push,
                   Syn    => False,
                   Fin    => False,
+                  Ack    => False,
                   Status => Status);
             when others =>
-               Status := Error;
+               Status := ENOBUFS;
          end case;
       end Send;
 
@@ -487,16 +506,15 @@ package body Net.Sockets.Tcp is
 
       procedure Receive
         (Data     : in out Net.Buffers.Buffer_Type; --  Raw data
-         Has_More : out Boolean)
-      is
+         Has_More : out Boolean) is
       begin
-         if Is_Empty (Recive_Queue) then
-            Set_Length (Data, 0);
+         if Is_Empty (Received_Queue) then
             Has_More := False;
          else
-            Peek (Recive_Queue, Data);
-            Recive_Window := Recive_Window + Get_Data_Size (Data, RAW_PACKET);
-            Has_More := not Is_Empty (Recive_Queue);
+            Peek (Received_Queue, Data);
+            Receive_Window := Receive_Window +
+              Get_Data_Size (Data, RAW_PACKET);
+            Has_More := not Is_Empty (Received_Queue);
          end if;
       end Receive;
 
@@ -506,27 +524,24 @@ package body Net.Sockets.Tcp is
 
       function Get_Receive_Room return Uint16 is
       begin
-         return Recive_Window;
+         return Receive_Window;
       end Get_Receive_Room;
 
       -----------
       -- Close --
       -----------
 
-      procedure Close (Status : out Status_Kind) is
+      procedure Close (Status : out Error_Code) is
 
          ---------
          -- Fin --
          ---------
 
-         procedure Fin (State : Socket_State_Type);
-         procedure Fin (State : Socket_State_Type) is
+         procedure Fin (State : Socket_State_Kind);
+         procedure Fin (State : Socket_State_Kind) is
          begin
             Send_Control (Syn => False, Fin => True, Status => Status);
-            if Status = Ok then
-               Set_State (State);
-               Process_Send_Queue (Ack_Now => False);
-            end if;
+            Set_State (State);
          end Fin;
 
       begin
@@ -539,7 +554,7 @@ package body Net.Sockets.Tcp is
 
             when Syn_Sent =>
                Set_State (Closed);
-               Status := Ok;
+               Status := EOK;
 
             when Syn_Received | Established =>
                --  Transition to FIN_WAIT_1 after sending FIN
@@ -550,7 +565,7 @@ package body Net.Sockets.Tcp is
                Fin (Last_Ack);
 
             when others =>
-               Status := Ok;
+               Status := EOK;
          end case;
       end Close;
 
@@ -558,17 +573,13 @@ package body Net.Sockets.Tcp is
       -- Drop --
       ----------
 
-      procedure Drop (Status : out Status_Kind) is
+      procedure Drop (Status : out Error_Code) is
       begin
          --  Send RST
          Send_Rst
-           (Src_IP   => Local_Addr,
-            Src_Port => Local_Port,
-            Dst_IP   => Remote_Addr,
-            Dst_Port => Remote_Port,
-            Ack      => True,
-            Seq_Num  => Send_Next,
-            Ack_Num  => Recive_Next,
+           (Ack      => True,
+            Seq_Num  => Send_Next_Control,
+            Ack_Num  => Receive_Next,
             Status   => Status);
 
          Set_State (Closed);
@@ -578,7 +589,7 @@ package body Net.Sockets.Tcp is
       -- Set_State --
       ---------------
 
-      procedure Set_State (New_State : Socket_State_Type)
+      procedure Set_State (New_State : Socket_State_Kind)
       is
          Old_List : Sockets_List_Kind := State_To_List (State);
          New_List : constant Sockets_List_Kind := State_To_List (New_State);
@@ -640,9 +651,7 @@ package body Net.Sockets.Tcp is
                Reestr.Add (New_List, Socket);
             end if;
 
-            if Socket.Callback_Kind = Tcp_Event_None then
-               Socket.Callback_Kind := Tcp_Event_State;
-            end if;
+            Call_Callback ((Kind => Tcp_Event_State, State => New_State));
          end if;
 
          State := New_State;
@@ -658,7 +667,7 @@ package body Net.Sockets.Tcp is
       procedure Send_Control
         (Syn    : Boolean;
          Fin    : Boolean;
-         Status : out Status_Kind)
+         Status : out Error_Code)
       is
          Empty : Buffer_Type;
       begin
@@ -667,6 +676,7 @@ package body Net.Sockets.Tcp is
             Push   => False,
             Syn    => Syn,
             Fin    => Fin,
+            Ack    => not Syn and then not Fin,
             Status => Status);
       end Send_Control;
 
@@ -679,21 +689,26 @@ package body Net.Sockets.Tcp is
          Push   : Boolean;
          Syn    : Boolean;
          Fin    : Boolean;
-         Status : out Status_Kind)
+         Ack    : Boolean;
+         Status : out Error_Code)
 
       is
          Num        : Uint32;
+         Len        : Uint16 := 0;
          Queue      : Buffer_List;
          Packet     : Buffer_Type;
-         Left       : Uint16 := Get_Data_Size (Data, RAW_PACKET);
+         Left       : Uint16 := 0;
          Pos        : Uint16 := 0;
          Tcp_Header : Net.Headers.TCP_Header_Access;
 
       begin
-         Status := Error;
+         Status := ENOBUFS;
 
          pragma Assert (not (Syn and Fin));
-         pragma Assert (not Syn or else not Fin);
+
+         if not Data.Is_Null then
+            Left := Get_Data_Size (Data, RAW_PACKET);
+         end if;
 
          Num := Next_Sequence_Num;
 
@@ -717,19 +732,18 @@ package body Net.Sockets.Tcp is
                   Data,
                   Pos,
                   Pos + Remote_MSS - 1);
-               Pos  := Pos + Remote_MSS;
+               Pos  := Pos  + Remote_MSS;
+               Len  := Len  + Remote_MSS;
                Left := Left - Remote_MSS;
-               Num  := Num + Uint32 (Remote_MSS);
 
             elsif Left > 0 then
                Copy (Packet, Data, Pos, Pos + Left - 1);
-               Num  := Num + Uint32 (Left);
+               Len  := Len + Left;
                Left := 0;
             end if;
 
             --  Fill TCP header fields
-            Tcp_Header := Packet.TCP;
-
+            Tcp_Header          := Packet.TCP;
             Tcp_Header.Th_Seq   := Num;
             Tcp_Header.Th_Ack   := 0;
             Tcp_Header.Th_Off   := TCP_Header_Net_Octets;
@@ -744,9 +758,10 @@ package body Net.Sockets.Tcp is
                Tcp_Header.Th_Flags := Tcp_Header.Th_Flags or Th_Flags_Fin;
             end if;
 
-            if Tcp_Header.Th_Flags = Th_Flags_Syn
-              and then Get_Data_Size (Packet, TCP_PACKET) = 0
+            if State = Syn_Sent
+              and then Tcp_Header.Th_Flags = Th_Flags_Syn
             then
+               --  The first SYN, add MSS Option
                Put_Uint8  (Packet, TCP_Option_MSS);
                Put_Uint8  (Packet, 4);
                Put_Uint16 (Packet, Max_Packet_Size);
@@ -758,6 +773,7 @@ package body Net.Sockets.Tcp is
             Set_Length (Packet, Get_Data_Size (Packet, RAW_PACKET));
             Append (Queue, Packet);
 
+            Num := Num + Uint32 (Len);
             exit when Left = 0;
          end loop;
 
@@ -765,18 +781,18 @@ package body Net.Sockets.Tcp is
             Num := Num + 1;
          end if;
 
-         --  Update next sequence number for stream
-         Next_Sequence_Num := Num;
-
          --  Push the temporary queue on the Send_Queue for later processing
-         --  by TCP_Output.
-
+         --  by Process_Send_Queue.
          if not Is_Empty (Queue) then
             Transfer (To => Send_Queue, From => Queue);
-            Process_Send_Queue (Ack_Now => False);
          end if;
 
-         Status := Ok;
+         --  Update next sequence number for stream since we added all data
+         --  in the queue
+         Next_Sequence_Num := Num;
+
+         Process_Send_Queue (Ack_Now => Ack, Status => Status);
+
       exception
          when others =>
             Release (Queue);
@@ -787,14 +803,17 @@ package body Net.Sockets.Tcp is
       -- Process_Send_Queue --
       ------------------------
 
-      procedure Process_Send_Queue (Ack_Now : Boolean) is
-         ACK_Sent     : Boolean := False;
-         Window       : constant Uint32 := Uint32'Min
+      procedure Process_Send_Queue
+        (Ack_Now : Boolean;
+         Status  : out Error_Code)
+      is
+         ACK_Sent   : Boolean := False;
+         Window     : constant Uint32 := Uint32'Min
            (Cwnd, Uint32 (Send_Window));
-         Packet       : Buffer_Type;
-         Segment_Size : Uint32;
-         Tcp_Header   : TCP_Header_Access;
-         Status       : Error_Code;
+         Packet     : Buffer_Type;
+         Tcp_Header : TCP_Header_Access;
+         Num        : Uint32;
+         Size       : Uint32;
 
       begin
          while not Is_Empty (Send_Queue) loop
@@ -804,14 +823,12 @@ package body Net.Sockets.Tcp is
             Peek (Send_Queue, Packet);
             Tcp_Header := Packet.TCP;
 
-            --  Get segment size
-            Segment_Size := Tcp_Header.Th_Seq +
-              Uint32 (Get_Data_Size (Packet, TCP_PACKET)) +
-              Uint32 (Tcp_Header.Th_Flags and Th_Flags_Syn) +
-              Uint32 (Tcp_Header.Th_Flags and Th_Flags_Fin);
+            --  Get segment data
+            Num  := Tcp_Header.Th_Seq;
+            Size := Uint32 (TCP_Data_Length (Packet, Tcp_Header));
 
             --  Check that we will not cross the Remote_Window
-            if Segment_Size > Send_Unacknowledged + Window then
+            if Size > Send_Unacknowledged + Window then
                --  return segment to Send_Queue
                Insert (Send_Queue, Packet);
                exit;
@@ -824,7 +841,9 @@ package body Net.Sockets.Tcp is
 
             Send_Packet (Packet, Status);
             exit when Status in ENOBUFS .. ENETUNREACH;
-            Send_Next := Send_Next + Segment_Size;
+            if Send_Next_Control < Num + Size then
+               Send_Next_Control := Num + Size;
+            end if;
          end loop;
 
          --  Send an empty ACK segment if needed
@@ -835,16 +854,16 @@ package body Net.Sockets.Tcp is
                Ack_Packet : Buffer_Type;
             begin
                Allocate (Ack_Packet);
-               if not Is_Null (Ack_Packet) then
+               if not Ack_Packet.Is_Null then
                   Set_Type (Ack_Packet, TCP_PACKET);
-                  Tcp_Header := Ack_Packet.TCP;
 
-                  Tcp_Header.Th_Seq   := Send_Next;
+                  Tcp_Header          := Ack_Packet.TCP;
+                  Tcp_Header.Th_Seq   := Send_Next_Control;
                   Tcp_Header.Th_Ack   := 0;
                   Tcp_Header.Th_Off   := TCP_Header_Net_Octets;
                   Tcp_Header.Th_Flags := Th_Flags_Ack;
 
-                  Send_Packet (Ack_Packet, Status);
+                  Push_Packet (Ack_Packet, Status);
                end if;
 
             exception
@@ -862,9 +881,7 @@ package body Net.Sockets.Tcp is
         (Packet : in out Buffer_Type;
          Status : out Error_Code)
       is
-         Tcp_Header    : TCP_Header_Access;
-         Pseudo_Header : TCP_Pseudo_Header;
-         Local         : Buffer_Type;
+         Local : Buffer_Type;
 
       begin
          Allocate (Local);
@@ -876,56 +893,25 @@ package body Net.Sockets.Tcp is
 
          Copy (From => Packet, To => Local);
 
-         Tcp_Header          := Packet.TCP;
-         Tcp_Header.Th_Sport := Local_Port;
-         Tcp_Header.Th_Dport := Remote_Port;
-
-         --  Fill in the ACK number field and advertise our receiving
-         --  window size
-         if (Tcp_Header.Th_Flags and Th_Flags_Ack) = 1 then
-            Tcp_Header.Th_Ack := Recive_Next;
-         end if;
-         Tcp_Header.Th_Win := Recive_Window;
-         Tcp_Header.Th_Urp := 0;
-
-         --  Compute checksum
-         Pseudo_Header.Source_IP      := Local_Addr;
-         Pseudo_Header.Destination_IP := Remote_Addr;
-         Pseudo_Header.Zero           := 0;
-         Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
-         Pseudo_Header.TCP_Length     := Get_Data_Size (Packet, IP_PACKET);
-
-         Tcp_Header.Th_Sum := 0;
-         Tcp_Header.Th_Sum := Net.Utils.TCP_Checksum (Pseudo_Header, Packet);
-
-         --  Initialize retransmitting data
-         if Retransmitting_Sequence = 0
-           or else Retransmitting_Sequence < Tcp_Header.Th_Seq
-         then
-            Retransmitting_Sequence := Tcp_Header.Th_Seq;
-            Retransmitting_Ticks    := TCP_Ticks;
-         end if;
-
-         --  Start retransmit timer if not already running
-         if Retransmit_Ticks < 0 then
-            Retransmit_Ticks := 0;
-         end if;
-
-         --  Convert header data to network order --
-         To_Network (Tcp_Header);
-
-         Net.Protos.IPv4.Make_Header
-           (IP (Packet),
-            Local_Addr,
-            Remote_Addr,
-            Net.Protos.IPv4.P_TCP,
-            Get_Data_Size (Packet, Net.Buffers.ETHER_PACKET));
-         Net.Protos.IPv4.Send_Raw (Ifnet, Remote_Addr, Packet, Status);
+         Push_Packet (Packet, Status);
 
          if Status in ENOBUFS .. ENETUNREACH then
             --  Did not send, return segment to the Send_Queue
             Insert (Send_Queue, Local);
          else
+            --  Initialize retransmitting data
+            if Retransmitting_Sequence = 0
+              or else Retransmitting_Sequence < Local.TCP.Th_Seq
+            then
+               Retransmitting_Sequence := Local.TCP.Th_Seq;
+               Retransmitting_Ticks    := Timeouts_Ticks_Count;
+            end if;
+
+            --  Start retransmit timer if not already running
+            if Retransmit_Ticks < 0 then
+               Retransmit_Ticks := 0;
+            end if;
+
             --  Append segment to the Unack_Queue
             Append (Unack_Queue, Local);
          end if;
@@ -937,41 +923,80 @@ package body Net.Sockets.Tcp is
             end if;
       end Send_Packet;
 
+      -----------------
+      -- Push_Packet --
+      -----------------
+
+      procedure Push_Packet
+        (Packet : in out Buffer_Type;
+         Status : out Error_Code)
+      is
+         Tcp_Header    : TCP_Header_Access;
+         Pseudo_Header : TCP_Pseudo_Header;
+
+      begin
+         Set_Length (Packet, Get_Data_Size (Packet, RAW_PACKET));
+
+         Tcp_Header          := Packet.TCP;
+         Tcp_Header.Th_Sport := Local_Port;
+         Tcp_Header.Th_Dport := Remote_Port;
+
+         --  Fill in the ACK number field and advertise our receiving
+         --  window size
+         if (Tcp_Header.Th_Flags and Th_Flags_Ack) > 0 then
+            Tcp_Header.Th_Ack := Receive_Next;
+         end if;
+         Tcp_Header.Th_Win := Receive_Window;
+         Tcp_Header.Th_Urp := 0;
+
+         --  Convert header data to network order --
+         To_Network (Tcp_Header);
+
+         --  Create Pseudo_Header for checksum calculation --
+         Pseudo_Header.Source_IP      := Local_Addr;
+         Pseudo_Header.Destination_IP := Remote_Addr;
+         Pseudo_Header.Zero           := 0;
+         Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
+         Pseudo_Header.TCP_Length     := To_Network
+           (Get_Data_Size (Packet, IP_PACKET));
+
+         --  Compute checksum --
+         Tcp_Header.Th_Sum := 0;
+         Tcp_Header.Th_Sum := Net.Utils.TCP_Checksum (Pseudo_Header, Packet);
+
+         Net.Protos.IPv4.Make_Header
+           (Packet.IP,
+            Local_Addr,
+            Remote_Addr,
+            Net.Protos.IPv4.P_TCP,
+            Get_Data_Size (Packet, Net.Buffers.ETHER_PACKET));
+         Net.Protos.IPv4.Send_Raw (Ifnet, Remote_Addr, Packet, Status);
+      end Push_Packet;
+
       --------------
       -- Received --
       --------------
 
       procedure Received
-        (Packet    : Net.Buffers.Buffer_Type;
+        (Packet    : in out Net.Buffers.Buffer_Type;
          Length    : Uint16;
          Processed : out Boolean)
       is
-         Packet_IP    : constant IP_Header_Access  := Packet.IP;
-         Packet_TCP   : constant TCP_Header_Access := Packet.TCP;
-         Data         : Net.Buffers.Buffer_Type;
+         Packet_IP  : constant IP_Header_Access  := Packet.IP;
+         Packet_TCP : constant TCP_Header_Access := Packet.TCP;
+         Status     : Error_Code;
 
-         Discard      : Boolean := False;
-         --  Set True to prevent any further processing
+         procedure Setup_Flow_Control;
+         --  Shared processing between passive and active open: once the
+         --  remote MSS is known, set up the congestion window and other
+         --  flow control parameters.
 
-         Win_L, Win_R : Uint32;
-         --  Left and right edges of receive window
-
-         Data_Len     : Uint16;
-         --  Length of non-duplicate data in segment
-
-         From         : Net.Uint16;
-         --  Start point of data slice
-
-         Status       : Status_Kind;
+         procedure Teardown (Callback : Boolean);
+         --  Tear down the current connection, notify user if Callback is True
 
          ------------------------
          -- Setup_Flow_Control --
          ------------------------
-
-         procedure Setup_Flow_Control;
-         --  Shared processing between passive and active open: once the remote
-         --  MSS is known, set up the congestion window and other flow control
-         --  parameters.
 
          procedure Setup_Flow_Control
          is
@@ -984,11 +1009,13 @@ package body Net.Sockets.Tcp is
             MSS                : Uint16 := 0;
             Window_Scale       : Uint8 with Unreferenced;
 
+            function Get_Option return Uint8;
+            procedure Check_Option_Length (Len : Uint8);
+
             ----------------
             -- Get_Option --
             ----------------
 
-            function Get_Option return Uint8;
             function Get_Option return Uint8
             is
                Result : constant Uint8 := Net.Buffers.Get_Uint8
@@ -1002,7 +1029,6 @@ package body Net.Sockets.Tcp is
             -- Check_Option_Length --
             -------------------------
 
-            procedure Check_Option_Length (Len : Uint8);
             procedure Check_Option_Length (Len : Uint8) is
                Actual_Len : Uint8;
             begin
@@ -1027,45 +1053,46 @@ package body Net.Sockets.Tcp is
                Option := Get_Option;
 
                case Option is
-               when TCP_Option_End | TCP_Option_NOP =>
-                  --  End of option list, No operation
+                  when TCP_Option_End | TCP_Option_NOP =>
+                     --  End of option list, No operation
 
-                  null;
+                     null;
 
-               when TCP_Option_MSS =>
-                  --  Maximum segment size
-                  Check_Option_Length (4);
-                  if not Malformed_Options then
-                     Value := Get_Option;
-                     MSS   := Uint16 (Value) * 256;
-                     Value := Get_Option;
-                     MSS   := MSS + Uint16 (Value);
-                  end if;
+                  when TCP_Option_MSS =>
+                     --  Maximum segment size
+                     Check_Option_Length (4);
+                     if not Malformed_Options then
+                        Value := Get_Option;
+                        MSS   := Uint16 (Value) * 256;
+                        Value := Get_Option;
+                        MSS   := MSS + Uint16 (Value);
+                     end if;
 
-               when TCP_Option_Win_Scale =>
-                  --  Window scale factor
-                  Check_Option_Length (3);
-                  if not Malformed_Options then
-                     Window_Scale := Get_Option;
-                  end if;
+                  when TCP_Option_Win_Scale =>
+                     --  Window scale factor
+                     Check_Option_Length (3);
+                     if not Malformed_Options then
+                        Window_Scale := Get_Option;
+                     end if;
 
-               when others =>
-                  if Data_Offset - Option_Offset < 1 then
-                     Malformed_Options := True;
-
-                  else
-                     Length := Get_Option;
-                     if Length < 2
-                       or else Data_Offset -
-                         Option_Offset < Uint16 (Length) - 2
-                     then
+                  when others =>
+                     if Data_Offset - Option_Offset < 1 then
                         Malformed_Options := True;
 
                      else
-                        --  Discard unknown option
-                        Option_Offset := Option_Offset + Uint16 (Length) - 2;
+                        Length := Get_Option;
+                        if Length < 2
+                          or else Data_Offset -
+                            Option_Offset < Uint16 (Length) - 2
+                        then
+                           Malformed_Options := True;
+
+                        else
+                           --  Discard unknown option
+                           Option_Offset := Option_Offset +
+                             Uint16 (Length) - 2;
+                        end if;
                      end if;
-                  end if;
                end case;
             end loop;
 
@@ -1087,17 +1114,18 @@ package body Net.Sockets.Tcp is
          -- Teardown --
          --------------
 
-         procedure Teardown (Callback : Boolean);
-         --  Tear down the current connection, notify user if Callback is True
-
          procedure Teardown (Callback : Boolean) is
          begin
             if Callback then
-               Socket.Callback_Kind := Tcp_Event_Abort;
+               Call_Callback ((Kind => Tcp_Event_Abort));
             end if;
             Set_State (Closed);
-            Discard := True;
          end Teardown;
+
+         Win_L, Win_R : Uint32;
+         --  Left and right edges of receive window
+         Data_Len     : Uint16;
+         --  Length of non-duplicate data in segment
 
       begin
          Processed := False;
@@ -1112,236 +1140,202 @@ package body Net.Sockets.Tcp is
 
          Processed := True;
 
-         case State is
-            when Syn_Sent =>
-               if (Packet_TCP.Th_Flags and Th_Flags_Ack) = 1 then
-                  --  Reject if ACK not in range
-                  if Packet_TCP.Th_Ack - 1 <= Init_Sequence_Num
-                    or else Packet_TCP.Th_Ack - 1 > Send_Next
-                  then
-                     if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 0 then
-                        Send_Rst
-                          (Src_IP   => Packet_IP.Ip_Dst,
-                           Src_Port => Packet_TCP.Th_Dport,
-                           Dst_IP   => Packet_IP.Ip_Src,
-                           Dst_Port => Packet_TCP.Th_Sport,
-                           Ack      => False,
-                           Seq_Num  => Packet_TCP.Th_Ack,
-                           Ack_Num  => 0,
-                           Status   => Status);
-                     end if;
-                     Discard := True;
-                  end if;
-               end if;
-
-               if not Discard then
-                  if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 1 then
-                     if (Packet_TCP.Th_Flags and Th_Flags_Ack) = 1 then
-                        --  Connection refused
-                        Teardown (True);
-                        return;
-                     end if;
-
-                     Discard := True;
-                  end if;
-               end if;
-
-               if not Discard then
-                  if (Packet_TCP.Th_Flags and Th_Flags_Syn) = 1 then
-                     Setup_Flow_Control;
-
-                     Init_Recive_Num := Packet_TCP.Th_Seq + 1;
-                     Recive_Next     := Init_Recive_Num + 1;
-
-                     if (Packet_TCP.Th_Flags and Th_Flags_Ack) = 1 then
-                        Process_Ack (Packet);
-                     end if;
-
-                     if Send_Unacknowledged > Init_Sequence_Num then
-                        Set_State (Established);
-                        Send_Control
-                          (Syn    => False,
-                           Fin    => False,
-                           Status => Status);
-
-                     else
-                        Set_State (Syn_Received);
-                        Send_Control
-                          (Syn    => True,
-                           Fin    => False,
-                           Status => Status);
-                     end if;
-                  end if;
-               end if;
-
-            when others =>
-               Allocate (Data);
-               Discard := Is_Null (Data);
-
-               if not Discard then
-                  --  Check sequence number
-                  Win_L := Recive_Next;
-                  Win_R := Recive_Next + Uint32 (Recive_Window);
-
-                  if not
-                    ((Recive_Window = 0
-                      and then Packet_TCP.Th_Seq = Recive_Next)
-                     or else
-                       (Win_L <= Packet_TCP.Th_Seq
-                        and then Packet_TCP.Th_Seq < Win_R)
-                     or else
-                       (Win_L <= Packet_TCP.Th_Seq + Uint32 (Length) - 1
-                        and then Packet_TCP.Th_Seq + Uint32 (Length) - 1 <
-                            Win_R))
-                  then
-                     --  Segment is not acceptable: send ACK
-                     --  (unless RST is present) and discard.
-
-                     if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 0 then
-                        Send_Control
-                          (Syn    => False,
-                           Fin    => False,
-                           Status => Status);
-                     end if;
-                     Discard := True;
-
-                  else
-                     --  Here if segment is acceptable
-
-                     --  Check RST bit
-                     if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 1 then
-                        Teardown (State in Established .. Close_Wait);
-                     end if;
-                  end if;
-               end if;
-
-               --  Check SYN bit
-               if not Discard
-                 and then (Packet_TCP.Th_Flags and Th_Flags_Syn) = 1
+         if State = Syn_Sent then
+            if (Packet_TCP.Th_Flags and Th_Flags_Ack) > 0 then
+               --  Reject if ACK not in range
+               if not (Init_Sequence_Num <= Packet_TCP.Th_Ack - 1
+                       and then Packet_TCP.Th_Ack - 1 < Send_Next_Control)
                then
-                  --  SYN is in the window: error, tear down connection
+                  if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 0 then
+                     Send_Rst
+                       (Ack     => False,
+                        Seq_Num => Packet_TCP.Th_Ack,
+                        Ack_Num => 0,
+                        Status  => Status);
+                  end if;
+                  return;
+               end if;
+            end if;
+
+            if (Packet_TCP.Th_Flags and Th_Flags_Rst) > 0 then
+               if (Packet_TCP.Th_Flags and Th_Flags_Ack) > 0 then
+                  --  Connection refused
                   Teardown (True);
                end if;
 
-               --  Check ACK field
-               if not Discard
-                 and then (Packet_TCP.Th_Flags and Th_Flags_Ack) = 0
+               return;
+            end if;
+
+            if (Packet_TCP.Th_Flags and Th_Flags_Syn) > 0 then
+               Setup_Flow_Control;
+
+               Init_Recive_Num := Packet_TCP.Th_Seq;
+               Receive_Next    := Init_Recive_Num + 1;
+
+               if (Packet_TCP.Th_Flags and Th_Flags_Ack) > 0 then
+                  Process_Ack (Packet);
+               end if;
+
+               if Send_Unacknowledged > Init_Sequence_Num then
+                  Send_Control
+                    (Syn    => False,
+                     Fin    => False,
+                     Status => Status);
+                  Set_State (Established);
+
+               else
+                  Set_State (Syn_Received);
+                  Send_Control
+                    (Syn    => True,
+                     Fin    => False,
+                     Status => Status);
+               end if;
+            end if;
+
+         else
+            --  Check sequence number
+            Win_L := Receive_Next;
+            Win_R := Receive_Next + Uint32 (Receive_Window);
+
+            if not
+              ((Receive_Window = 0
+                and then Packet_TCP.Th_Seq = Receive_Next)
+               or else
+                 (Win_L <= Packet_TCP.Th_Seq
+                  and then Packet_TCP.Th_Seq < Win_R)
+               or else
+                 (Win_L <= Packet_TCP.Th_Seq + Uint32 (Length) - 1
+                  and then Packet_TCP.Th_Seq + Uint32 (Length) - 1 <
+                      Win_R))
+            then
+               --  Segment is not acceptable: send ACK
+               --  (unless RST is present).
+
+               if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 0 then
+                  Send_Control
+                    (Syn    => False,
+                     Fin    => False,
+                     Status => Status);
+               end if;
+               return;
+
+            else
+               --  Here if segment is acceptable
+
+               --  Check RST bit
+               if (Packet_TCP.Th_Flags and Th_Flags_Rst) > 0 then
+                  Teardown (State in Established .. Close_Wait);
+                  return;
+               end if;
+            end if;
+
+            --  Check SYN bit
+            if (Packet_TCP.Th_Flags and Th_Flags_Syn) > 0 then
+               --  SYN is in the window: error, tear down connection
+               Teardown (True);
+               return;
+            end if;
+
+            --  Check ACK field
+            if (Packet_TCP.Th_Flags and Th_Flags_Ack) = 0 then
+               return;
+            end if;
+
+            if State = Syn_Received then
+               if Send_Unacknowledged <= Packet_TCP.Th_Ack
+                 and then Packet_TCP.Th_Ack < Send_Next_Control + 1
                then
-                  Discard := True;
+                  Set_State (Established);
+               else
+                  Send_Rst
+                    (Ack     => False,
+                     Seq_Num => Packet_TCP.Th_Ack,
+                     Ack_Num => 0,
+                     Status  => Status);
+                  Teardown (False);
+                  return;
                end if;
+            end if;
 
-               if not Discard then
-                  if State = Syn_Received then
-                     if Send_Unacknowledged <= Packet_TCP.Th_Ack
-                       and then Packet_TCP.Th_Ack < Send_Next + 1
-                     then
-                        Set_State (Established);
-                     else
-                        Send_Rst
-                          (Src_IP   => Packet_IP.Ip_Dst,
-                           Src_Port => Packet_TCP.Th_Dport,
-                           Dst_IP   => Packet_IP.Ip_Src,
-                           Dst_Port => Packet_TCP.Th_Sport,
-                           Ack      => False,
-                           Seq_Num  => Packet_TCP.Th_Ack,
-                           Ack_Num  => 0,
-                           Status   => Status);
-                        Teardown (False);
-                     end if;
+            case State is
+               when Syn_Received =>
+                  --  Can't happen, processed previously
+                  null;
+
+               when Established | Fin_Wait_1 | Fin_Wait_2 =>
+                  Process_Ack (Packet);
+
+                  if Packet_TCP.Th_Seq < Receive_Next then
+                     --  Drop head of segment that was already received
+
+                     Data_Len := Length -
+                       Uint16 (Receive_Next - Packet_TCP.Th_Seq);
+
+                  else
+                     Data_Len := Length;
                   end if;
-               end if;
 
-               if not Discard then
-                  case State is
-                     when Syn_Received =>
-                        --  Can't happen, processed previously
-                        null;
+                  Receive_Next := Packet_TCP.Th_Seq + Uint32 (Data_Len);
 
-                     when Established | Fin_Wait_1 | Fin_Wait_2 =>
-                        Process_Ack (Packet);
-
-                        From := TCP_Position + TCP_Header_Length (Packet_TCP);
-
-                        if Packet_TCP.Th_Seq < Recive_Next then
-                           --  Drop head of segment that was already received
-
-                           Data_Len := Length -
-                             Uint16 (Recive_Next - Packet_TCP.Th_Seq);
-
-                           From := From +
-                             Uint16 (Recive_Next - Packet_TCP.Th_Seq);
-                        else
-                           Data_Len := Length;
-                        end if;
-
-                        Recive_Next := Packet_TCP.Th_Seq + Uint32 (Data_Len);
-
-                        if Packet_TCP.Th_Seq < Uint32 (Recive_Window) then
-                           Recive_Window := Recive_Window - Data_Len;
-
-                        else
-                           Recive_Window := 0;
-                        end if;
-
-                        if Data_Len > 0 then
-                           --  Store data in the recive list
-                           Copy
-                             (Data,
-                              Packet,
-                              From,
-                              Get_Length (Packet) - 1);
-                           Set_Length (Data, Get_Data_Size (Data, RAW_PACKET));
-                           Append (Recive_Queue, Data);
-                           Socket.Callback_Kind := Tcp_Event_Recv;
-
-                           Process_Send_Queue (Ack_Now => False);
-                        end if;
-
-                     when others =>
-                        --  Ignore urgent pointer and segment text
-                        null;
-                  end case;
-
-                  --  Check FIN bit
-                  if (Packet_TCP.Th_Flags and Th_Flags_Fin) = 1 then
-                     case State is
-                        when Closed | Syn_Sent =>
-                           null;
-
-                        when Established | Syn_Received =>
-                           --  Notify connection closed: deliver 0 bytes of
-                           --  data. First transition to Close_Wait, as the
-                           --  application may decide to call Close from
-                           --  within the callback.
-
-                           Set_State (Close_Wait);
-
-                        when Fin_Wait_1 =>
-                           --  If our FIN has been Ack'd then we are already in
-                           --  Closing or Fin_Wait_2.
-                           Set_State (Closing);
-
-                        when Fin_Wait_2 =>
-                           Set_State (Time_Wait);
-
-                           --  Start 2MSL timeout
-                           Watchdog_Ticks := TCP_Ticks;
-
-                        when Close_Wait | Closing | Last_Ack =>
-                           null;
-
-                        when Time_Wait =>
-                           --  Restart 2MSL timeout
-                           Watchdog_Ticks := TCP_Ticks;
-                     end case;
+                  if (Packet_TCP.Th_Flags and Th_Flags_Fin) > 0 then
+                     --  Dec 1 if the packet has FIN
+                     Data_Len := Data_Len - 1;
                   end if;
-               end if;
-         end case;
-         Release (Data);
 
-      exception
-         when others =>
-            Release (Data);
+                  if Data_Len < Receive_Window then
+                     Receive_Window := Receive_Window - Data_Len;
+
+                  else
+                     Receive_Window := 0;
+                  end if;
+
+                  if Data_Len > 0 then
+                     --  Store raw data in the recive list
+                     Packet.Delete_Headers (Packet.Get_Length - Data_Len);
+                     Append (Received_Queue, Packet);
+                     Call_Callback ((Kind => Tcp_Event_Recv));
+                  end if;
+                  Process_Send_Queue (Ack_Now => False, Status => Status);
+
+               when others =>
+                  --  Ignore urgent pointer and segment text
+                  null;
+            end case;
+
+            --  Check FIN bit
+            if (Packet_TCP.Th_Flags and Th_Flags_Fin) > 0 then
+               case State is
+                  when Closed | Syn_Sent =>
+                     null;
+
+                  when Established | Syn_Received =>
+                     --  Notify connection closed: deliver 0 bytes of
+                     --  data. First transition to Close_Wait, as the
+                     --  application may decide to call Close from
+                     --  within the callback.
+
+                     Set_State (Close_Wait);
+
+                  when Fin_Wait_1 =>
+                     --  If our FIN has been Ack'd then we are already in
+                     --  Closing or Fin_Wait_2.
+                     Set_State (Closing);
+
+                  when Fin_Wait_2 =>
+                     --  -> FIN, <-ACK, <-FIN so now we have to send ACK and
+                     --  close the socket
+                     Send_Control (False, False, Status);
+                     Set_State (Closed);
+
+                  when Close_Wait | Closing | Last_Ack =>
+                     null;
+
+                  when Time_Wait =>
+                     --  Restart 2MSL timeout
+                     Watchdog_Ticks := Timeouts_Ticks_Count;
+               end case;
+            end if;
+         end if;
       end Received;
 
       -----------------
@@ -1354,7 +1348,7 @@ package body Net.Sockets.Tcp is
          Prev       : Net.Buffers.Buffer_Type;
          Prev_TCP   : TCP_Header_Access;
          Length     : Uint16;
-         Status     : Status_Kind;
+         Status     : Error_Code;
 
          --------------------------
          -- Update_RTT_Estimator --
@@ -1391,7 +1385,7 @@ package body Net.Sockets.Tcp is
             --  Invalid ack for a seqno not sent yet should have been discarded,
             --  so we end up here for an ACK that acks new data.
 
-            pragma Assert (Packet_TCP.Th_Ack <= Send_Next);
+            pragma Assert (Packet_TCP.Th_Ack <= Send_Next_Control);
 
             Send_Unacknowledged := Packet_TCP.Th_Ack;
 
@@ -1414,7 +1408,7 @@ package body Net.Sockets.Tcp is
               and then Retransmitting_Sequence <= Packet_TCP.Th_Ack
             then
                Update_RTT_Estimator
-                 (Uint16 (TCP_Ticks - Retransmitting_Ticks));
+                 (Uint16 (Timeouts_Ticks_Count - Retransmitting_Ticks));
                Retransmitting_Ticks := 0;
             end if;
 
@@ -1422,8 +1416,8 @@ package body Net.Sockets.Tcp is
             while not Is_Empty (Unack_Queue) loop
                Peek (Unack_Queue, Prev);
 
-               Length := TCP_Payload_Length (Prev);
                Prev_TCP := Prev.TCP;
+               Length   := TCP_Data_Length (Prev, Prev_TCP);
 
                if Prev_TCP.Th_Seq + Uint32 (Length) > Packet_TCP.Th_Ack then
                   Insert (Unack_Queue, Prev);
@@ -1434,37 +1428,35 @@ package body Net.Sockets.Tcp is
                --  Note: For a segment carrying a FIN, we do not signal it sent
                --  if the ack covers all of the data but not the FIN flag.
 
-               if Socket.Callback_Kind = Tcp_Event_None then
-                  Socket.Callback_Kind := Tcp_Event_Sent;
-               end if;
+               Call_Callback ((Kind => Tcp_Event_Sent));
 
-               if (Prev_TCP.Th_Flags and Th_Flags_Fin) = 1 then
+               if (Prev_TCP.Th_Flags and Th_Flags_Fin) > 0 then
                   case State is
                      when Fin_Wait_1 =>
+                        --  FIN sent, have ACK so we are in Fin_Wait_2
                         Set_State (Fin_Wait_2);
 
                         --  Start Fin_Wait_2 timeout
-                        Watchdog_Ticks := TCP_Ticks;
+                        Watchdog_Ticks := Timeouts_Ticks_Count;
 
                      when Closing =>
                         Set_State (Time_Wait);
 
                         --  Start 2MSL timeout
-                        Watchdog_Ticks := TCP_Ticks;
+                        Watchdog_Ticks := Timeouts_Ticks_Count;
 
                      when Last_Ack =>
                         Set_State (Closed);
 
                      when Time_Wait =>
-
-                        --  Ack retransmitted FIN
+                        --  Have FIN, send ACK
                         Send_Control
                           (Syn    => False,
                            Fin    => False,
                            Status => Status);
 
                         --  Restart 2MSL timeout
-                        Watchdog_Ticks := TCP_Ticks;
+                        Watchdog_Ticks := Timeouts_Ticks_Count;
 
                      when others =>
                         --  Can't happen (we sent a FIN)
@@ -1523,13 +1515,14 @@ package body Net.Sockets.Tcp is
          Remove : Boolean := False;
       begin
          if (State = Fin_Wait_2
-             and then TCP_Ticks - Watchdog_Ticks > Fin_Wait_Timeout)
+             and then Timeouts_Ticks_Count - Watchdog_Ticks > Fin_Wait_Timeout)
            or else
              (State = Syn_Received
-              and then TCP_Ticks - Watchdog_Ticks > Syn_Received_Timeout)
+              and then Timeouts_Ticks_Count - Watchdog_Ticks >
+                Syn_Received_Timeout)
            or else
              (State = Last_Ack
-              and then TCP_Ticks - Watchdog_Ticks > Time_Wait_Timeout)
+              and then Timeouts_Ticks_Count - Watchdog_Ticks > Time_Wait_Timeout)
          then
             Remove := True;
 
@@ -1542,8 +1535,8 @@ package body Net.Sockets.Tcp is
                   Persist_Ticks := 0;
 
                   --  Double persist backoff up to Max_Persist_Backoff
-                  Persist_Backoff := Int16'Min
-                    (Max_Persist_Backoff, Persist_Backoff * 2);
+                  Persist_Backoff := Int32'Min
+                    (Maximum_Persist_Backoff, Persist_Backoff * 2);
 
                   Send_Window_Probe;
                end if;
@@ -1558,14 +1551,15 @@ package body Net.Sockets.Tcp is
                  and then Retransmit_Ticks > Int16 (RTO)
                then
                   if State = Syn_Sent then
-                     --  SYN_SENT case: no backoff, MAX_SYN_RTX limit
-                     if Retransmit_Count > TCP_MAX_SYN_RTX then
+                     --  Syn_Sent: no backoff, Maximum_SYN_Retransmits limit
+                     if Retransmit_Count > Maximum_SYN_Retransmits then
                         Remove := True;
                      end if;
 
                   else
-                     --  All other cases: exponential backoff, MAX_RTS limit
-                     if Retransmit_Count > TCP_MAX_RTX then
+                     --  All other cases: exponential backoff,
+                     --  Maximum_Retransmits limit
+                     if Retransmit_Count > Maximum_Retransmits then
                         Remove := True;
                      else
                         RTO := RTO * 2;
@@ -1587,9 +1581,7 @@ package body Net.Sockets.Tcp is
          end if;
 
          if Remove then
-            if Socket.Callback_Kind = Tcp_Event_None then
-               Socket.Callback_Kind := Tcp_Event_Abort;
-            end if;
+            Call_Callback ((Kind => Tcp_Event_Abort));
             Set_State (Closed);
          end if;
       end Check_Timeouts;
@@ -1600,7 +1592,7 @@ package body Net.Sockets.Tcp is
 
       procedure Check_Time_Wait is
       begin
-         if TCP_Ticks - Watchdog_Ticks > Time_Wait_Timeout then
+         if Timeouts_Ticks_Count - Watchdog_Ticks > Time_Wait_Timeout then
             Set_State (Closed);
          end if;
       end Check_Time_Wait;
@@ -1623,41 +1615,45 @@ package body Net.Sockets.Tcp is
 
       begin
          if not Is_Empty (Unack_Queue) then
-            Copy (Unack_Queue, Packet);
+            Duplicate_First (Unack_Queue, Packet);
 
          elsif not Is_Empty (Send_Queue) then
-            Copy (Send_Queue, Packet);
+            Duplicate_First (Send_Queue, Packet);
          end if;
 
-         if not Is_Null (Packet) then
-            Length := TCP_Payload_Length (Packet);
-            Packet_TCP := Packet.TCP;
+         if Is_Null (Packet) then
+            return;
+         end if;
 
-            Probe_Fin := (Packet_TCP.Th_Flags and Th_Flags_Fin) = 1
-              and then Length = 1;
+         Packet_TCP := Packet.TCP;
+         Length     := TCP_Data_Length (Packet, Packet_TCP);
 
-            Allocate (Probe);
-            if not Is_Null (Probe) then
-               Set_Type (Probe, TCP_PACKET);
-               Probe_TCP := Probe.TCP;
-               Probe_TCP.Th_Off := TCP_Header_Net_Octets;
-               Probe_TCP.Th_Seq := Packet_TCP.Th_Seq;
-               if Probe_Fin then
-                  Probe_TCP.Th_Flags := (Th_Flags_Fin or Th_Flags_Ack);
-               else
-                  Probe_TCP.Th_Flags := Th_Flags_Ack;
-               end if;
+         Probe_Fin := (Packet_TCP.Th_Flags and Th_Flags_Fin) > 0
+           and then Length = 1;
 
-               if not Probe_Fin then
-                  Put_Uint8
-                    (Probe,
-                     Get_Uint8
-                       (Packet,
-                        TCP_Position + TCP_Header_Length (Packet_TCP)));
-               end if;
+         Allocate (Probe);
+         if not Is_Null (Probe) then
+            Set_Type (Probe, TCP_PACKET);
 
-               Send_Packet (Probe, Status);
+            Probe_TCP        := Probe.TCP;
+            Probe_TCP.Th_Seq := Packet_TCP.Th_Seq;
+            Probe_TCP.Th_Ack := 0;
+            Probe_TCP.Th_Off := TCP_Header_Net_Octets;
+            if Probe_Fin then
+               Probe_TCP.Th_Flags := (Th_Flags_Fin or Th_Flags_Ack);
+            else
+               Probe_TCP.Th_Flags := Th_Flags_Ack;
             end if;
+
+            if not Probe_Fin then
+               Put_Uint8
+                 (Probe,
+                  Get_Uint8
+                    (Packet,
+                     TCP_Position + TCP_Header_Length (Packet_TCP)));
+            end if;
+
+            Push_Packet (Probe, Status);
          end if;
 
       exception
@@ -1669,7 +1665,9 @@ package body Net.Sockets.Tcp is
       -- Retransmit_Timeout --
       ------------------------
 
-      procedure Retransmit_Timeout is
+      procedure Retransmit_Timeout
+      is
+         Status : Error_Code;
       begin
          --  Bump retransmit count, reset timer
          Retransmit_Count := Retransmit_Count + 1;
@@ -1690,25 +1688,76 @@ package body Net.Sockets.Tcp is
          Transfer (To => Send_Queue, From => Unack_Queue);
 
          --  Start output
-         Process_Send_Queue (Ack_Now => False);
+         Process_Send_Queue (Ack_Now => False, Status => Status);
       end Retransmit_Timeout;
 
-   end State_Protected_Object;
+      --------------
+      -- Send_Rst --
+      --------------
 
-   -------------------
-   -- Call_Callback --
-   -------------------
+      procedure Send_Rst
+        (Ack     : Boolean;
+         Seq_Num : Uint32;
+         Ack_Num : Uint32;
+         Status  : out Error_Code)
+      is
+         Packet     : Buffer_Type;
+         TCP_Header : TCP_Header_Access;
 
-   procedure Call_Callback (This : in out Socket) is
-   begin
-      if This.Callback_Proc /= null then
-         if This.Callback_Kind /= Tcp_Event_None then
-            This.Callback_Proc.all (This.Self, This.Callback_Kind);
+      begin
+         Status := ENOBUFS;
+
+         Allocate (Packet);
+         if Is_Null (Packet) then
+            return;
          end if;
-      end if;
 
-      This.Callback_Kind := Tcp_Event_None;
-   end Call_Callback;
+         Set_Type (Packet, TCP_PACKET);
+         TCP_Header := Packet.TCP;
+
+         TCP_Header.Th_Dport := Remote_Port;
+         TCP_Header.Th_Sport := Local_Port;
+         TCP_Header.Th_Seq   := Seq_Num;
+         TCP_Header.Th_Ack   := Ack_Num;
+         TCP_Header.Th_Off   := TCP_Header_Net_Octets;
+         if Ack then
+            TCP_Header.Th_Flags := Th_Flags_Ack or Th_Flags_Rst;
+         else
+            TCP_Header.Th_Flags := Th_Flags_Rst;
+         end if;
+         TCP_Header.Th_Win := 0;
+         TCP_Header.Th_Sum := 0;
+         TCP_Header.Th_Urp := 0;
+
+         Set_Length (Packet, Get_Data_Size (Packet, RAW_PACKET));
+
+         Net.Protos.IPv4.Make_Header
+           (Packet.IP,
+            Local_Addr,
+            Remote_Addr,
+            Net.Protos.IPv4.P_TCP,
+            Get_Data_Size (Packet, Net.Buffers.ETHER_PACKET));
+         Net.Protos.IPv4.Send_Raw (Ifnet, Remote_Addr, Packet, Status);
+
+      exception
+         when others =>
+            Release (Packet);
+      end Send_Rst;
+
+      -------------------
+      -- Call_Callback --
+      -------------------
+
+      procedure Call_Callback (Event : Tcp_Event) is
+      begin
+         if Socket /= null
+           and then Socket.Callback /= null
+         then
+            Socket.Callback (Socket, Event);
+         end if;
+      end Call_Callback;
+
+   end State_Protected_Object;
 
    ----------
    -- Bind --
@@ -1717,16 +1766,14 @@ package body Net.Sockets.Tcp is
    procedure Bind
      (This   : in out Socket;
       Port   : Uint16;
-      Cb     : Callback;
-      Status : out Status_Kind) is
+      Status : out Error_Code) is
    begin
-      This.Callback_Proc := Cb;
-      Status             := Error;
+      Status := ENOBUFS;
 
       if This.State_No = 0 then
          for Index in 1 .. Max_Sockets_Count loop
             States (Index).Bind (This.Self, Port, Status);
-            if Status = Ok then
+            if Status = EOK then
                This.State_No := Index;
                exit;
             end if;
@@ -1734,13 +1781,6 @@ package body Net.Sockets.Tcp is
       else
          States (This.State_No).Bind (This.Self, Port, Status);
       end if;
-
-      if Status = Ok then
-         This.Callback_Kind := Tcp_Event_None;
-      else
-         This.Callback_Proc := null;
-      end if;
-      Call_Callback (This);
    end Bind;
 
    -------------
@@ -1751,10 +1791,9 @@ package body Net.Sockets.Tcp is
      (This   : in out Socket;
       Addr   : Ip_Addr;
       Port   : Uint16;
-      Status : out Status_Kind) is
+      Status : out Error_Code) is
    begin
       States (This.State_No).Connect (Addr, Port, Status);
-      Call_Callback (This);
    end Connect;
 
    --------------
@@ -1763,12 +1802,11 @@ package body Net.Sockets.Tcp is
 
    procedure Received
      (This      : Socket_Access;
-      Packet    : Net.Buffers.Buffer_Type;
+      Packet    : in out Net.Buffers.Buffer_Type;
       Length    : Uint16;
       Processed : out Boolean) is
    begin
       States (This.State_No).Received (Packet, Length, Processed);
-      Call_Callback (This.all);
    end Received;
 
    --------------------
@@ -1778,7 +1816,6 @@ package body Net.Sockets.Tcp is
    procedure Check_Timeouts (This : Socket_Access) is
    begin
       States (This.State_No).Check_Timeouts;
-      Call_Callback (This.all);
    end Check_Timeouts;
 
    ---------------------
@@ -1788,14 +1825,13 @@ package body Net.Sockets.Tcp is
    procedure Check_Time_Wait (This : Socket_Access) is
    begin
       States (This.State_No).Check_Time_Wait;
-      Call_Callback (This.all);
    end Check_Time_Wait;
 
    ---------------
    -- Get_State --
    ---------------
 
-   function Get_State (This : Socket) return Socket_State_Type is
+   function Get_State (This : Socket) return Socket_State_Kind is
    begin
       if This.State_No = 0 then
          return Closed;
@@ -1822,14 +1858,13 @@ package body Net.Sockets.Tcp is
      (This   : in out Socket;
       Data   : Net.Buffers.Buffer_Type;
       Push   : Boolean;
-      Status : out Status_Kind) is
+      Status : out Error_Code) is
    begin
       if Is_Null (Data) or else Get_Data_Size (Data, RAW_PACKET) = 0 then
-         Status := Error;
+         Status := ENOBUFS;
       else
          States (This.State_No).Send (Data, Push, Status);
       end if;
-      Call_Callback (This);
    end Send;
 
    -------------------
@@ -1850,10 +1885,7 @@ package body Net.Sockets.Tcp is
       Data     : in out Net.Buffers.Buffer_Type; --  Raw data
       Has_More : out Boolean) is
    begin
-      if not Is_Null (Data) then
-         States (This.State_No).Receive (Data, Has_More);
-      end if;
-      Call_Callback (This);
+      States (This.State_No).Receive (Data, Has_More);
    end Receive;
 
    ----------------------
@@ -1871,15 +1903,10 @@ package body Net.Sockets.Tcp is
 
    procedure Close
      (This   : in out Socket;
-      Status : out Status_Kind) is
+      Status : out Error_Code) is
    begin
       if This.State_No /= 0 then
          States (This.State_No).Close (Status);
-         if Status = Ok then
-            This.Callback_Proc := null;
-         else
-            Call_Callback (This);
-         end if;
       end if;
    end Close;
 
@@ -1889,48 +1916,55 @@ package body Net.Sockets.Tcp is
 
    procedure Drop
      (This   : in out Socket;
-      Status : out Status_Kind) is
+      Status : out Error_Code) is
    begin
       States (This.State_No).Drop (Status);
-      if Status = Ok then
-         This.Callback_Proc := null;
-      else
-         Call_Callback (This);
-      end if;
    end Drop;
+
+   ------------------
+   -- Set_Callback --
+   ------------------
+
+   procedure Set_Callback
+     (This     : in out Socket;
+      Callback : Callback_Procedure) is
+   begin
+      This.Callback := Callback;
+   end Set_Callback;
 
    --------------
    -- Received --
    --------------
 
-   procedure Received (Packet : Net.Buffers.Buffer_Type)
+   procedure Received
+     (Ifnet  : in out Net.Interfaces.Ifnet_Type'Class;
+      Packet : in out Net.Buffers.Buffer_Type)
    is
-      Payload_Length   : Uint16;
-      Packet_IP        : constant IP_Header_Access  := Packet.IP;
-      Packet_TCP       : constant TCP_Header_Access := Packet.TCP;
-      Pseudo_Header    : TCP_Pseudo_Header;
-      Data_Offset      : Uint16;
-      Processed        : Boolean;
+      pragma Unreferenced (Ifnet);
+
+      Data_Length   : Uint16;
+      Packet_IP     : constant IP_Header_Access  := Packet.IP;
+      Packet_TCP    : constant TCP_Header_Access := Packet.TCP;
+      Pseudo_Header : TCP_Pseudo_Header;
+      Data_Offset   : Uint16;
+      Processed     : Boolean := False;
 
       Ack              : Boolean;
       Seq_Num, Ack_Num : Uint32;
-      Status           : Status_Kind;
+      Status           : Error_Code;
 
    begin
+      Net.Protos.IPv4.To_Host (Packet_IP);
 
-      To_Host (Packet_TCP);
-
-      Payload_Length := Packet_IP.Ip_Len - IP_Header_Length (Packet_IP);
+      Data_Length := Packet_IP.Ip_Len - IP_Header_Length (Packet_IP);
 
       --  Verify TCP checksum
-      if Check_Incoming_Checksums
-        and then Packet_TCP.Th_Sum /= 0
-      then
+      if Packet_TCP.Th_Sum /= 0 then
          Pseudo_Header.Source_IP      := Packet_IP.Ip_Src;
          Pseudo_Header.Destination_IP := Packet_IP.Ip_Dst;
          Pseudo_Header.Zero           := 0;
          Pseudo_Header.Protocol       := Net.Protos.IPv4.P_TCP;
-         Pseudo_Header.TCP_Length     := Payload_Length;
+         Pseudo_Header.TCP_Length     := To_Network (Data_Length);
 
          if not Net.Utils.Check_TCP_Checksum (Pseudo_Header, Packet) then
             --  Not valid checksum, do not process the packet
@@ -1938,26 +1972,29 @@ package body Net.Sockets.Tcp is
          end if;
       end if;
 
+      --  Convert to host's byte order --
+      To_Host (Packet_TCP);
+
       Data_Offset := TCP_Header_Length (Packet_TCP);
 
-      Payload_Length := Payload_Length - Data_Offset +
-        Uint16 (Packet_TCP.Th_Flags and Th_Flags_Syn) +
-        Uint16 (Packet_TCP.Th_Flags and Th_Flags_Fin);
+      Data_Length := Data_Length - Data_Offset +
+        (if (Packet_TCP.Th_Flags and Th_Flags_Syn) > 0 then 1 else 0) +
+        (if (Packet_TCP.Th_Flags and Th_Flags_Fin) > 0 then 1 else 0);
 
       --  Get copy of active socets
       Reestr.Get_List_Copy (Active);
 
-      for Position in 1 .. Processing_Sockets.Last loop
+      for Idx in 1 .. Processing_Sockets.Last loop
          Received
-           (This      => Processing_Sockets.List (Position),
+           (This      => Processing_Sockets.List (Idx),
             Packet    => Packet,
-            Length    => Payload_Length,
+            Length    => Data_Length,
             Processed => Processed);
          exit when Processed;
       end loop;
 
       if not Processed then
-         if (Packet_TCP.Th_Flags and Th_Flags_Rst) = 1 then
+         if (Packet_TCP.Th_Flags and Th_Flags_Rst) > 0 then
             --  Discard incoming RST without associated socket
             null;
 
@@ -1967,7 +2004,7 @@ package body Net.Sockets.Tcp is
 
             if (Packet_TCP.Th_Flags and Th_Flags_Ack) = 0 then
                Seq_Num := 0;
-               Ack_Num := Packet_TCP.Th_Seq + Uint32 (Payload_Length);
+               Ack_Num := Packet_TCP.Th_Seq + Uint32 (Data_Length);
                Ack     := True;
             else
                Seq_Num := Packet_TCP.Th_Ack;
@@ -1975,7 +2012,7 @@ package body Net.Sockets.Tcp is
                Ack     := False;
             end if;
 
-            Send_Rst
+            Send_Rst_Flag
               (Src_IP   => Packet_IP.Ip_Dst,
                Src_Port => Packet_TCP.Th_Dport,
                Dst_IP   => Packet_IP.Ip_Src,
@@ -1988,11 +2025,11 @@ package body Net.Sockets.Tcp is
       end if;
    end Received;
 
-   --------------
-   -- Send_Rst --
-   --------------
+   -------------------
+   -- Send_Rst_Flag --
+   -------------------
 
-   procedure Send_Rst
+   procedure Send_Rst_Flag
      (Src_IP   : Ip_Addr;
       Src_Port : Uint16;
       Dst_IP   : Ip_Addr;
@@ -2000,51 +2037,50 @@ package body Net.Sockets.Tcp is
       Ack      : Boolean;
       Seq_Num  : Uint32;
       Ack_Num  : Uint32;
-      Status   : out Status_Kind)
+      Status   : out Error_Code)
    is
-      Buffer     : Buffer_Type;
-      Buffer_TCP : TCP_Header_Access;
-      Code       : Error_Code;
+      Packet     : Buffer_Type;
+      TCP_Header : TCP_Header_Access;
 
    begin
-      Status := Error;
+      Status := ENOBUFS;
 
-      Allocate (Buffer);
-      if Is_Null (Buffer) then
+      Allocate (Packet);
+      if Is_Null (Packet) then
          return;
       end if;
 
-      Set_Type (Buffer, TCP_PACKET);
-      Buffer_TCP := Buffer.TCP;
+      Set_Type (Packet, TCP_PACKET);
+      TCP_Header := Packet.TCP;
 
-      Buffer_TCP.Th_Dport := Dst_Port;
-      Buffer_TCP.Th_Sport := Src_Port;
-      Buffer_TCP.Th_Seq   := Seq_Num;
-      Buffer_TCP.Th_Ack   := Ack_Num;
-      Buffer_TCP.Th_Off   := TCP_Header_Net_Octets;
+      TCP_Header.Th_Dport := Dst_Port;
+      TCP_Header.Th_Sport := Src_Port;
+      TCP_Header.Th_Seq   := Seq_Num;
+      TCP_Header.Th_Ack   := Ack_Num;
+      TCP_Header.Th_Off   := TCP_Header_Net_Octets;
       if Ack then
-         Buffer_TCP.Th_Flags := Th_Flags_Ack or Th_Flags_Rst;
+         TCP_Header.Th_Flags := Th_Flags_Ack or Th_Flags_Rst;
       else
-         Buffer_TCP.Th_Flags := Th_Flags_Rst;
+         TCP_Header.Th_Flags := Th_Flags_Rst;
       end if;
-      Buffer_TCP.Th_Win := 0;
-      Buffer_TCP.Th_Sum := 0;
-      Buffer_TCP.Th_Urp := 0;
+      TCP_Header.Th_Win := 0;
+      TCP_Header.Th_Sum := 0;
+      TCP_Header.Th_Urp := 0;
+
+      Set_Length (Packet, Get_Data_Size (Packet, RAW_PACKET));
 
       Net.Protos.IPv4.Make_Header
-        (IP (Buffer),
+        (Packet.IP,
          Src_IP,
          Dst_IP,
          Net.Protos.IPv4.P_TCP,
-         Get_Data_Size (Buffer, Net.Buffers.RAW_PACKET) - 14);
-      Net.Protos.IPv4.Send_Raw (Ifnet, Dst_IP, Buffer, Code);
-
-      Status := (if Code = EOK then Ok else Error);
+         Get_Data_Size (Packet, Net.Buffers.RAW_PACKET) - 14);
+      Net.Protos.IPv4.Send_Raw (Ifnet, Dst_IP, Packet, Status);
 
    exception
       when others =>
-         Release (Buffer);
-   end Send_Rst;
+         Release (Packet);
+   end Send_Rst_Flag;
 
    --------------------
    -- Check_Timeouts --
@@ -2052,7 +2088,7 @@ package body Net.Sockets.Tcp is
 
    procedure Check_Timeouts is
    begin
-      TCP_Ticks := TCP_Ticks + 1;
+      Timeouts_Ticks_Count := Timeouts_Ticks_Count + 1;
 
       Reestr.Get_List_Copy (Active);
 
@@ -2060,60 +2096,27 @@ package body Net.Sockets.Tcp is
          Check_Timeouts (Processing_Sockets.List (Pos));
       end loop;
 
-      --  Purge old TIME_WAIT PCBs
-
+      --  Check Time_Wait list
       Reestr.Get_List_Copy (Time_Wait);
       for Pos in 1 .. Processing_Sockets.Last loop
          Check_Time_Wait (Processing_Sockets.List (Pos));
       end loop;
    end Check_Timeouts;
 
-   ----------------
-   -- Initialize --
-   ----------------
+   ---------------------
+   -- TCP_Data_Length --
+   ---------------------
 
-   procedure Initialize is
+   function TCP_Data_Length
+     (Packet : Net.Buffers.Buffer_Type;
+      Header : Net.Headers.TCP_Header_Access)
+      return Uint16 is
    begin
-      --  Ticks per second
-      TCP_Ticks := Uint32
-        (Ada.Real_Time."/"(One_Second, Check_TCP_Status_Time));
-
-      Fin_Wait_Timeout := Uint32 (20 * TCP_Ticks); --  20 s
-
-      Syn_Received_Timeout := Uint32 (20 * TCP_Ticks); --  20 s
-
-      Time_Wait_Timeout := 2 * (2 * TCP_TTL) * TCP_Ticks;
-
-      Initial_Persist_Backoff :=
-        Int16 (Ada.Real_Time."/"(One_And_Half_Second, Check_TCP_Status_Time));
-      --  1.5s
-
-      Max_Persist_Backoff := Int16 (60 * TCP_Ticks); --  60s
-   end Initialize;
-
-   ------------------------
-   -- TCP_Payload_Length --
-   ------------------------
-
-   function TCP_Payload_Length
-     (Packet : Net.Buffers.Buffer_Type)
-      return Uint16
-   is
-      Packet_IP  : constant IP_Header_Access  := Packet.IP;
-      Packet_TCP : constant TCP_Header_Access := Packet.TCP;
-      Result     : Uint16;
-   begin
-      if Packet_IP.Ip_Len /= 0 then
-         Result := Packet_IP.Ip_Len - IP_Header_Length (Packet_IP);
-      else
-         Result := Get_Data_Size (Packet, IP_PACKET);
-      end if;
-
-      return Result -
-        (TCP_Header_Length (Packet_TCP) +
-        Uint16 (Packet_TCP.Th_Flags and Th_Flags_Syn) +
-        Uint16 (Packet_TCP.Th_Flags and Th_Flags_Fin));
-   end TCP_Payload_Length;
+      return Get_Data_Size (Packet, IP_PACKET) -
+        TCP_Header_Length (Header) +
+        (if (Header.Th_Flags and Th_Flags_Syn) > 0 then 1 else 0) +
+        (if (Header.Th_Flags and Th_Flags_Fin) > 0 then 1 else 0);
+   end TCP_Data_Length;
 
    -------------
    -- To_Host --

@@ -294,6 +294,25 @@ package body Net.Buffers is
       Buf.Pos := Buf.Pos + F'Length;
    end Copy;
 
+   --------------------
+   -- Delete_Headers --
+   --------------------
+
+   procedure Delete_Headers
+     (Buf : in out Buffer_Type;
+      To  : Net.Uint16)
+   is
+      L : constant Uint16 := Buf.Packet.Data'Last - To;
+   begin
+      Buf.Packet.Data (0 .. L) := Buf.Packet.Data (To .. Buf.Packet.Data'Last);
+      Buf.Packet.Size := Buf.Packet.Size - To;
+      if Buf.Size /= 0 then
+         Buf.Size := Buf.Packet.Size;
+      else
+         Buf.Pos := Buf.Packet.Size;
+      end if;
+   end Delete_Headers;
+
    --  ------------------------------
    --  Get a byte from the buffer, moving the buffer read position.
    --  ------------------------------
@@ -549,18 +568,17 @@ package body Net.Buffers is
       end if;
    end Peek;
 
-   ----------
-   -- Copy --
-   ----------
+   ---------------------
+   -- Duplicate_First --
+   ---------------------
 
-   procedure Copy
+   procedure Duplicate_First
      (From : in out Buffer_List;
       Buf  : in out Buffer_Type) is
    begin
-      Buf.Packet.Data := From.Head.Data;
-      Buf.Packet.Size := From.Head.Size;
-      Buf.Size        := Buf.Packet.Size;
-   end Copy;
+      Buf.Packet := From.Head;
+      Buf.Size   := Buf.Packet.Size;
+   end Duplicate_First;
 
    --  ------------------------------
    --  Transfer the list of buffers held by <tt>From</tt> at end of the list held

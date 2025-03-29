@@ -203,6 +203,13 @@ package Net.Buffers is
       To_End : Net.Uint16)
        with Pre => not Buf.Is_Null and not From.Is_Null;
 
+   procedure Delete_Headers
+     (Buf : in out Buffer_Type;
+      To  : Net.Uint16)
+     with Pre => not Buf.Is_Null;
+   --  Deletes header from 0 to To-1. Used to remove headers and
+   --  leave only packet's user data.
+
    --  Get a byte from the buffer, moving the buffer read position.
    function Get_Uint8 (Buf : in out Buffer_Type) return Net.Uint8 with
      Pre => not Buf.Is_Null;
@@ -310,16 +317,20 @@ package Net.Buffers is
 
    --  Peek a buffer from the list.
    procedure Peek (From : in out Buffer_List;
-                   Buf  : in out Buffer_Type);
+                   Buf  : in out Buffer_Type)
+     with Pre => Buf.Is_Null;
+
+   procedure Duplicate_First
+     (From : in out Buffer_List;
+      Buf  : in out Buffer_Type)
+     with Pre => not Is_Empty (From) and Buf.Is_Null;
+   --  Make a duplicate of the first From list element to Buf. Buf should
+   --  not be Released. Used to get some data form the first element and avoid
+   --  Peek/Insert routine.
 
    --  Transfer the list of buffers held by <tt>From</tt> at end of the list held
    --  by <tt>To</tt>.  After the transfer, the <tt>From</tt> list is empty.
    --  The complexity is in O(1).
-
-   procedure Copy
-     (From : in out Buffer_List;
-      Buf  : in out Buffer_Type);
-   --  Copy data from the head to the buf
 
    procedure Transfer (To   : in out Buffer_List;
                        From : in out Buffer_List) with

@@ -39,6 +39,7 @@ package Net is
    subtype Uint64 is Interfaces.Unsigned_64;
 
    subtype Int16 is Interfaces.Integer_16;
+   subtype Int32 is Interfaces.Integer_32;
 
    --  Length of an IPv4 packet.
    type Ip_Length is new Uint16;

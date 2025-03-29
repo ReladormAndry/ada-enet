@@ -1,42 +1,46 @@
 
+with Ada.Streams;         use Ada.Streams;
+with GNAT.Random_Numbers;
+
+with Net.Buffers;
+with Net.Protos.Dispatchers;
+with Net.Protos.IPv4;
+with Net.Utils;
+
 package body Tap_TCP is
 
-   --------------
-   -- Callback --
-   --------------
+   Buffer_Memory : Ada.Streams.Stream_Element_Array
+     (1 .. 2_048 * Stream_Element_Offset (Net.Buffers.NET_ALLOC_SIZE));
+   Random        : GNAT.Random_Numbers.Generator;
 
-   procedure Callback
-     (This  : Socket_Access;
-      Event : Tcp_Event_Kind)
-   is
-      pragma Unreferenced (This);
+   function Get_Random return Net.Uint32;
+
+   ----------------
+   -- Get_Random --
+   ----------------
+
+   function Get_Random return Net.Uint32 is
    begin
-      Watchdog.Release (Event);
-   end Callback;
+      return GNAT.Random_Numbers.Random (Random);
+   end Get_Random;
 
-   --------------
-   -- Watchdog --
-   --------------
+   Dummy : Net.Protos.Receive_Handler;
 
-   protected body Watchdog is
+   ----------------
+   -- Initialize --
+   ----------------
 
-      entry Wait (Event : out Tcp_Event_Kind)
-        when Released is
-      begin
-         Event    := Last;
-         Last     := Tcp_Event_None;
-         Released := False;
-      end Wait;
+   procedure Initialize is
+   begin
+      Net.Buffers.Add_Region
+        (Addr => Buffer_Memory'Address,
+         Size => Buffer_Memory'Length);
 
-      -------------
-      -- Release --
-      -------------
+      GNAT.Random_Numbers.Reset (Random);
+      Net.Utils.Set_Random_Function (Get_Random'Unrestricted_Access);
 
-      procedure Release (Event : Tcp_Event_Kind) is
-      begin
-         Last     := Event;
-         Released := True;
-      end Release;
-   end Watchdog;
+      Net.Protos.Dispatchers.Set_Handler
+        (Net.Protos.IPv4.P_TCP, Sockets.Received'Access, Dummy);
+   end Initialize;
 
 end Tap_TCP;

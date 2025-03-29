@@ -1,42 +1,24 @@
 pragma Profile (Ravenscar);
 
-with Ada.Real_Time;
-
 with Net.Interfaces.Tap;
 with Net.Sockets.Tcp;
+with Net.Generic_Receiver;
 
 package Tap_TCP is
 
-   INet : aliased Net.Interfaces.Tap.Tap_Ifnet;
+   Tap : aliased Net.Interfaces.Tap.Tap_Ifnet;
 
    -- Sockets --
 
    package Sockets is new Net.Sockets.Tcp
-     (Ifnet                    => Net.Interfaces.Ifnet_Type'Class (INet),
-      Max_Sockets_Count        => 1,
-      Use_IRQ                  => False,
-      Read_Delay               => Ada.Real_Time.Milliseconds (10),
-      Max_Read_Time            => Ada.Real_Time.Milliseconds (4),
-      Check_TCP_Status_Time    => Ada.Real_Time.Milliseconds (500),
-      Check_Incoming_Checksums => False,
-      Send_Outcoming_Checksums => False);
+     (Ifnet             => Net.Interfaces.Ifnet_Type'Class (Tap),
+      Max_Sockets_Count => 1);
 
-   use Sockets;
+   package LAN_Receiver is new Net.Generic_Receiver
+     (Net.Interfaces.Ifnet_Type'Class (Tap));
 
-   procedure Callback
-     (This  : Socket_Access;
-      Event : Tcp_Event_Kind);
+   Socket : Sockets.Socket;
 
-   -- Watchdog --
-
-   protected Watchdog is
-
-      entry Wait (Event : out Tcp_Event_Kind);
-      procedure Release (Event : Tcp_Event_Kind);
-
-   private
-      Last     : Tcp_Event_Kind := Tcp_Event_None;
-      Released : Boolean := False;
-   end Watchdog;
+   procedure Initialize;
 
 end Tap_TCP;

@@ -388,9 +388,7 @@ package body Net.DHCP is
       while Packet.Available > 0 loop
          Option := Packet.Get_Uint8;
          if Option = OPT_END then
-            pragma Warnings (Off);
             Options.Msg_Type := Msg_Type;
-            pragma Warnings (On);
             return;
          elsif Option /= OPT_PAD and Packet.Available > 0 then
             Length := Packet.Get_Uint8;
